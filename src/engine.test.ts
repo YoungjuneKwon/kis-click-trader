@@ -3,10 +3,10 @@ import { Rejected, TradingEngine } from './engine';
 import { defaultRule, type Book, type Broker, type OrderRef, type OrderStatus } from './model';
 import { parseBook } from './kis';
 
-const symbol = { code: '005930', name: '삼성전자', base: 72000 };
+const symbol = { code: '005930', name: '삼성전자' };
 const book = (price = 72000): Book => ({ symbol: symbol.code, time: Date.now(), last: price, asks: [{ price: price + 100, qty: 50 }], bids: [{ price, qty: 100 }], totalAsk: 50, totalBid: 100 });
 class Fake implements Broker {
-  kind = 'demo' as const;
+  kind = 'kis' as const;
   statuses = new Map<string, OrderStatus>();
   n = 0;
   fail = false;

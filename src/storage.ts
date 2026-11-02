@@ -1,5 +1,5 @@
 import { openDB, type IDBPDatabase } from 'idb';
-import { credentialsSchema, defaultRule, ruleSchema, type Credentials, type Rule, type Snapshot } from './model';
+import { credentialsSchema, defaultRule, ruleSchema, symbols, type Credentials, type Rule, type Snapshot, type SymbolInfo } from './model';
 
 let dbPromise: Promise<IDBPDatabase> | undefined;
 const database = () => dbPromise ??= openDB('click-trader', 1, { upgrade(db) { db.createObjectStore('vault'); db.createObjectStore('sessions', { keyPath: 'id' }); db.createObjectStore('tokens'); } });
@@ -34,8 +34,15 @@ export async function storeToken(account: string, secret: string, value: { token
   const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, await key(secret, salt), encoder.encode(JSON.stringify(value)));
   await (await database()).put('tokens', { salt, iv, ciphertext }, account);
 }
-export function loadPreferences(): { symbol: string; quantity: number; rule: Rule } {
-  try { const p = JSON.parse(localStorage.getItem('click-trader.preferences') || '{}'); return { symbol: /^\d{6}$/.test(p.symbol) ? p.symbol : '005930', quantity: Number.isInteger(p.quantity) && p.quantity > 0 ? p.quantity : 1, rule: ruleSchema.safeParse(p.rule).success ? p.rule : defaultRule }; }
-  catch { return { symbol: '005930', quantity: 1, rule: defaultRule }; }
+export type Preferences = { selected?: SymbolInfo; quantity: number; rule: Rule };
+export function loadPreferences(): Preferences {
+  try {
+    const p = JSON.parse(localStorage.getItem('click-trader.preferences') || '{}');
+    // Old versions silently selected Samsung; require an explicit selection in this version.
+    const selected = p.symbolConfirmed === true && /^\d{6}$/.test(p.symbol)
+      ? symbols.find(s => s.code === p.symbol) || { code: p.symbol, name: typeof p.symbolName === 'string' && p.symbolName.trim() ? p.symbolName.slice(0, 40) : p.symbol }
+      : undefined;
+    return { selected, quantity: Number.isInteger(p.quantity) && p.quantity > 0 ? Math.min(p.quantity, 100000) : 1, rule: ruleSchema.safeParse(p.rule).success ? p.rule : defaultRule };
+  } catch { return { quantity: 1, rule: defaultRule }; }
 }
-export function savePreferences(value: ReturnType<typeof loadPreferences>) { localStorage.setItem('click-trader.preferences', JSON.stringify(value)); }
+export function savePreferences(value: Preferences) { localStorage.setItem('click-trader.preferences', JSON.stringify({ symbol: value.selected?.code, symbolName: value.selected?.name, symbolConfirmed: !!value.selected, quantity: value.quantity, rule: value.rule })); }

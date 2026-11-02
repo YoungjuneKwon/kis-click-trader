@@ -90,7 +90,7 @@ export class KisBroker implements Broker {
             if (!Number.isInteger(width)) throw new Error('시세 묶음 길이가 올바르지 않습니다.');
             for (let i = 0; i < count; i++) {
               const record = fields.slice(i * width, (i + 1) * width);
-              if (tr === 'H0STASP0') { this.lastBook = parseBook(record.join('^')); this.lastBook.last = this.quote || this.lastBook.bids[0].price; onBook(this.lastBook); bookReady = true; }
+              if (tr === 'H0STASP0') { this.lastBook = parseBook(record.join('^')); this.lastBook.last = this.quote; onBook(this.lastBook); bookReady = true; }
               else this.quote = num(record[2]);
             }
           }
