@@ -1,14 +1,10 @@
 import { z } from 'zod';
 
-export const credentialsSchema = z.object({
-  appKey: z.string().trim().min(1, 'App Key를 입력해 주세요.'),
-  appSecret: z.string().trim().min(1, 'App Secret을 입력해 주세요.'),
-  cano: z.string().regex(/^\d{8}$/, '계좌번호 앞 8자리를 입력해 주세요.'),
-  product: z.string().regex(/^\d{2}$/, '계좌 상품코드 2자리를 입력해 주세요.'),
-  htsId: z.string().trim().min(1, '체결통보 구독용 HTS ID를 입력해 주세요.'),
-  env: z.enum(['prod', 'vps']), transport: z.enum(['direct', 'relay']),
+export const serverSessionSchema = z.object({
+  authenticated: z.literal(true), env: z.enum(['prod', 'vps']),
+  accountTag: z.string().regex(/^[a-f0-9]{64}$/), realtimeFillsConfigured: z.boolean(),
 });
-export type Credentials = z.infer<typeof credentialsSchema>;
+export type ServerSession = z.infer<typeof serverSessionSchema>;
 export type SymbolInfo = { code: string; name: string };
 export const symbols: SymbolInfo[] = [
   { code: '005930', name: '삼성전자' },

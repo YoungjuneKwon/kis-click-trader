@@ -1,10 +1,11 @@
 import { lazy, Suspense, useEffect, useRef, useState, type FormEvent } from 'react';
-import { Activity, ArrowDown, ArrowDownRight, ArrowRight, ArrowUpRight, Check, ChevronDown, CircleHelp, KeyRound, LockKeyhole, Power, Radio, Settings2, ShieldCheck, Unplug, X } from 'lucide-react';
-import { clock, credentialsSchema, ruleSchema, signed, symbols, won, type Book, type Broker, type Credentials, type Rule, type Snapshot, type SymbolInfo } from './model';
-import { deleteCredentials, hasCredentials, loadPreferences, saveCredentials, savePreferences, saveSnapshot, sessions, unlockCredentials } from './storage';
+import { Activity, ArrowDown, ArrowDownRight, ArrowRight, ArrowUpRight, Check, ChevronDown, CircleHelp, LockKeyhole, Power, Radio, Settings2, ShieldCheck, Unplug, X } from 'lucide-react';
+import { clock, ruleSchema, signed, symbols, won, type Book, type Broker, type ServerSession, type Rule, type Snapshot, type SymbolInfo } from './model';
+import { clearClientSecrets, loadPreferences, savePreferences, saveSnapshot, sessions } from './storage';
 import { TradingEngine } from './engine';
 import { KisBroker } from './kis';
-import { KeyForm, SetupScreen, SymbolPicker } from './Setup';
+import { LockForm, SetupScreen, SymbolPicker } from './Setup';
+import { lockServer, serverStatus, unlockServer } from './api';
 
 const initial = loadPreferences();
 const PerformanceChart = lazy(() => import('./PerformanceChart'));
@@ -19,12 +20,11 @@ export default function App() {
   const [book, setBook] = useState<Book>();
   const [snapshot, setSnapshot] = useState<Snapshot>();
   const [message, setMessage] = useState('');
-  const [keyError, setKeyError] = useState('');
+  const [authError, setAuthError] = useState('');
   const [busy, setBusy] = useState(false);
-  const [credentials, setCredentials] = useState<Credentials>();
-  const [stored, setStored] = useState(false);
-  const [vaultChecked, setVaultChecked] = useState(false);
-  const [credentialTab, setCredentialTab] = useState<'new' | 'unlock'>('new');
+  const [session, setSession] = useState<ServerSession>();
+  const [sessionChecked, setSessionChecked] = useState(false);
+  const [backendReady, setBackendReady] = useState(false);
   const [advanced, setAdvanced] = useState(false);
   const [help, setHelp] = useState(false);
   const [now, setNow] = useState(Date.now());
@@ -33,7 +33,6 @@ export default function App() {
   const liveConnection = useRef(false);
   const release = useRef<(() => void) | undefined>(undefined);
   const poll = useRef<ReturnType<typeof setInterval> | undefined>(undefined);
-  const keyPopover = useRef<HTMLDivElement>(null);
   const exitDialog = useRef<HTMLDialogElement>(null);
   const bookElement = useRef<HTMLDivElement>(null);
   const quantityHeld = snapshot?.lots.reduce((n, l) => n + l.qty - l.sold, 0) || 0;
@@ -48,7 +47,14 @@ export default function App() {
   const connected = status === 'connected';
   const stale = !!book && now - book.time > 10000;
 
-  useEffect(() => { void hasCredentials().then(v => { setStored(v); if (v) setCredentialTab('unlock'); }).catch(e => setKeyError(errorText(e))).finally(() => setVaultChecked(true)); const timer = setInterval(() => setNow(Date.now()), 1000); return () => { clearInterval(timer); clearInterval(poll.current); broker.current?.disconnect(); release.current?.(); }; }, []);
+  useEffect(() => {
+    void clearClientSecrets().catch(e => setMessage(errorText(e)));
+    void serverStatus().then(value => { setSession(value); setBackendReady(true); }).catch(e => { setBackendReady(false); setAuthError(errorText(e)); }).finally(() => setSessionChecked(true));
+    const locked = () => { clearInterval(poll.current); broker.current?.disconnect(); release.current?.(); release.current = undefined; liveConnection.current = false; setBook(undefined); setStatus('idle'); setSession(undefined); setAuthError('서버 세션이 잠겼습니다. 다시 인증해 주세요.'); };
+    window.addEventListener('click-trader:locked', locked);
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => { window.removeEventListener('click-trader:locked', locked); clearInterval(timer); clearInterval(poll.current); broker.current?.disconnect(); release.current?.(); };
+  }, []);
   useEffect(() => { try { savePreferences({ selected, quantity, rule }); } catch { setMessage('브라우저 설정 저장에 실패했습니다.'); } }, [selected, quantity, rule]);
   useEffect(() => { const el = bookElement.current; if (el && book) el.scrollTop = Math.max(0, (el.scrollHeight - el.clientHeight) / 2); }, [book?.symbol]);
   useEffect(() => {
@@ -66,13 +72,13 @@ export default function App() {
       }).catch(reject);
     });
   }
-  async function connect(nextSymbol = selected, supplied = credentials) {
+  async function connect(nextSymbol = selected) {
     if (busy) return;
-    if (!supplied || !nextSymbol) return;
+    if (!session || !nextSymbol) return;
     if (exposed) {
       if (nextSymbol.code !== selected?.code) { setMessage('보유·미체결 주문을 모두 정리한 뒤 종목을 바꿔 주세요.'); return; }
       setBusy(true); setMessage('');
-      try { await broker.current!.connect(nextSymbol.code, b => engine.current!.onBook(b), connectionStatus, () => { void engine.current!.sync().catch(e => setMessage(errorText(e))); }); await engine.current!.sync(); }
+      try { await acquire(); await broker.current!.connect(nextSymbol.code, b => engine.current!.onBook(b), connectionStatus, () => { void engine.current!.sync().catch(e => setMessage(errorText(e))); }); await engine.current!.sync(); }
       catch (e) { setMessage(errorText(e)); connectionStatus('error'); }
       finally { setBusy(false); }
       return;
@@ -80,10 +86,10 @@ export default function App() {
     setBusy(true); setMessage(''); connectionStatus('connecting');
     let next: Broker | undefined;
     try {
-      if (supplied.env === 'vps') throw new Error('KIS 모의계좌의 정정가능조회 지원은 미검증입니다. 현재 버전은 실전 어댑터만 연결합니다.');
+      if (session.env === 'vps') throw new Error('KIS 모의계좌의 정정가능조회 지원은 미검증입니다. 현재 버전은 실전 어댑터만 연결합니다.');
       await acquire(); clearInterval(poll.current); broker.current?.disconnect(); setBook(undefined);
-      next = new KisBroker(supplied);
-      const tag = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(`${supplied.env}:${supplied.cano}:${supplied.product}:${supplied.appKey}`)))).map(n => n.toString(16).padStart(2, '0')).join('');
+      next = new KisBroker(session.env);
+      const tag = session.accountTag;
       const history = await sessions();
       const restored = history.find(s => s.kind === 'kis' && s.accountTag === tag && (s.entries.some(e => e.state !== 'done') || s.lots.some(l => l.state !== 'closed')));
       if (restored && restored.started < new Date().setHours(0, 0, 0, 0)) throw new Error('이전 날짜의 미종결 거래가 있습니다. HTS에서 잔고·주문을 대조해야 합니다. 이 PoC는 당일 주문만 복구합니다.');
@@ -93,6 +99,7 @@ export default function App() {
       engine.current = instance; broker.current = next; setSnapshot(structuredClone(instance.state)); setSelected(nextSymbol);
       await next.connect(nextSymbol.code, b => instance.onBook(b), connectionStatus, () => { void instance.sync().catch(e => setMessage(errorText(e))); });
       await saveSnapshot(instance.state);
+      if (next instanceof KisBroker) instance.log(next.fillDetail);
       poll.current = setInterval(() => { if (instance.exposed) void instance.sync().catch(e => setMessage(errorText(e))); }, 3000);
       if (restored) { instance.log('저장된 주문 상태 복원 · KIS 체결 내역 대조'); await instance.sync(); }
       if (next instanceof KisBroker) {
@@ -124,30 +131,24 @@ export default function App() {
     if (!engine.current) return; setBusy(true); setMessage('');
     try { await engine.current.closeAll(); await engine.current.sync(); } catch (e) { setMessage(errorText(e)); } finally { setBusy(false); }
   }
-  async function handleKeys(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault(); setBusy(true); setKeyError('');
+  async function handleUnlock(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setBusy(true); setAuthError('');
     const element = event.currentTarget;
     const form = new FormData(element);
     try {
-      if (engine.current?.exposed) throw new Error('미종결 주문이 있어 계좌 키를 변경할 수 없습니다.');
-      let value: Credentials;
-      if (credentialTab === 'unlock') value = await unlockCredentials(String(form.get('password')));
-      else { const parsed = credentialsSchema.safeParse(Object.fromEntries(form)); if (!parsed.success) throw new Error(parsed.error.issues[0].message); value = parsed.data; await saveCredentials(value, String(form.get('password'))); setStored(true); }
-      disconnect(); broker.current = null; engine.current = null; setSnapshot(undefined);
-      setCredentials(value); element.reset(); setCredentialTab('unlock'); keyPopover.current?.hidePopover(); setMessage('키를 잠금 해제했습니다. KIS 연결을 시작하면 인증과 실제 호가 수신을 시작합니다.');
-    } catch (e) { setKeyError(errorText(e)); } finally { setBusy(false); }
+      const value = await unlockServer(String(form.get('password')));
+      setSession(value); element.reset(); setMessage('화면 잠금을 해제했습니다. API 인증정보는 로컬 서버에서 관리합니다.');
+    } catch (e) { setAuthError(errorText(e)); } finally { setBusy(false); }
   }
   function exportTrades() {
     const text = JSON.stringify({ exported: new Date().toISOString(), session: snapshot }, null, 2);
     const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([text], { type: 'application/json' })); a.download = 'click-trader-session.json'; a.click(); URL.revokeObjectURL(a.href);
   }
-  async function forgetKeys() {
+  async function handleLock() {
     try {
-      if (engine.current?.exposed) throw new Error('미종결 주문이 있어 키를 삭제할 수 없습니다.');
-      disconnect(); broker.current = null; engine.current = null;
-      await deleteCredentials(); setCredentials(undefined); setStored(false); setCredentialTab('new'); setKeyError('');
-      setMessage('저장된 키와 토큰을 삭제했습니다.');
-    } catch (e) { setKeyError(errorText(e)); }
+      if (engine.current?.exposed) { exitDialog.current?.showModal(); return; }
+      await lockServer(); disconnect(); broker.current = null; engine.current = null; setSnapshot(undefined); setSession(undefined); setAuthError('');
+    } catch (e) { setMessage(errorText(e)); }
   }
   function changeSymbol() {
     if (exposed || busy) return;
@@ -156,24 +157,23 @@ export default function App() {
   const maxQty = Math.max(1, ...(book?.asks.map(a => a.qty) || []), ...(book?.bids.map(b => b.qty) || []));
   const total = (book?.totalAsk || 0) + (book?.totalBid || 0);
   const stateText = status === 'idle' ? '연결 대기' : status === 'connected' ? 'KIS 연결됨' : status === 'connecting' ? '연결 중' : status === 'error' ? '연결 실패' : status === 'disconnected' ? '연결 끊김' : status;
+  const pollingFills = !(broker.current instanceof KisBroker) || broker.current.fillMode === 'polling';
+  const fillDetail = broker.current instanceof KisBroker ? broker.current.fillDetail : '체결 확인: REST 3초 간격 조회';
 
-  if (!vaultChecked) return <SetupScreen step="loading" />;
-  if (!credentials) return <SetupScreen step="keys">
-    <span className="section-label">LOCAL KEY VAULT</span>
-    <h2>{stored ? '계좌 키를 잠금 해제해 주세요.' : '계좌 키를 먼저 입력해 주세요.'}</h2>
-    <KeyForm stored={stored} tab={credentialTab} onTab={setCredentialTab} busy={busy} error={keyError} onSubmit={e => void handleKeys(e)} onDelete={() => void forgetKeys()} autoFocus />
-  </SetupScreen>;
+  if (!sessionChecked) return <SetupScreen step="loading" />;
+  if (!session) return <SetupScreen step="lock"><LockForm busy={busy} disabled={!backendReady} error={authError} onSubmit={e => void handleUnlock(e)} /></SetupScreen>;
   if (!selected) return <SetupScreen step="symbol"><SymbolPicker onSelect={setSelected} /></SetupScreen>;
 
   return <div className="app-shell">
     <header className="topbar">
       <a className="brand" href="./"><span className="brand-mark"><Activity size={21} strokeWidth={2.2} /></span><span>click<span className="brand-light">trader</span><sup>POC</sup></span></a>
-      <div className="top-actions"><span className="local-badge"><LockKeyhole size={13} /> 로컬 퍼스트</span><button className="button subtle key-button" popoverTarget="key-popover"><KeyRound size={16} />{credentials ? '키 연결됨' : stored ? '키 잠금 해제' : '키 입력'}</button><button className="icon-button" aria-label="사용 안내" onClick={() => setHelp(!help)}><CircleHelp size={18} /></button></div>
+      <div className="top-actions"><span className="local-badge"><LockKeyhole size={13} /> 로컬 서버 연결</span><button className="button subtle key-button" disabled={busy || exposed} onClick={() => void handleLock()}><LockKeyhole size={16} />화면 잠금</button><button className="icon-button" aria-label="사용 안내" onClick={() => setHelp(!help)}><CircleHelp size={18} /></button></div>
     </header>
     <main>
       <section className="page-heading"><div><div className="eyebrow">YOUR ENTRY. YOUR RULES.</div><h1>진입은 직접, 청산은 규칙대로.</h1><p>호가를 보고 매수하세요. 익절과 손절은 설정한 규칙이 이어받습니다.</p></div><button className="button subtle end-button" onClick={() => exitDialog.current?.showModal()}><Power size={15} /> 거래 종료</button></section>
-      {help && <section className="notice help"><ShieldCheck size={18} /><div><strong>이 화면이 열려 있는 동안 자동 청산이 동작합니다.</strong><p>KIS WebSocket에서 받은 실제 호가만 표시합니다. 실현손익은 이 세션 거래와 입력한 비용률을 기준으로 한 추정치이며, 계좌 전체 손익은 아닙니다. 손절은 지정가 정정으로 실행되어 체결 가격·시점을 보장하지 않습니다.</p><p>정적 호스팅에서는 KIS CORS 및 ws:// 혼합 콘텐츠 제한이 있습니다. 로컬 실행의 개발 릴레이로 연결을 검증할 수 있습니다. 탭 종료·절전·네트워크 단절 시 손절 감시는 중단됩니다.</p></div><button className="icon-button" aria-label="안내 닫기" onClick={() => setHelp(false)}><X size={16} /></button></section>}
-      <section className="connection-bar"><span className="pill">KIS {credentials.env === 'vps' ? '모의' : '실전'} · KRX</span><span className={`connection-state ${connected ? 'online' : ''}`}><i />{stateText}</span><span className="connection-caption">실제 체결 / 호가 WebSocket</span><button className="button connection-button" disabled={busy} onClick={() => connected ? disconnect() : void connect()}>{connected ? <Unplug size={14} /> : <Radio size={14} />}{connected ? '연결 종료' : 'KIS 연결 시작'}</button></section>
+      {help && <section className="notice help"><ShieldCheck size={18} /><div><strong>이 화면이 열려 있는 동안 자동 청산이 동작합니다.</strong><p>로컬 Node.js 서버가 KIS REST·WebSocket을 중계합니다. API 인증정보와 화면 암호는 서버 환경변수에서만 읽습니다. 실현손익은 이 세션 거래와 설정한 비용률 기준 추정치입니다.</p><p>손절은 지정가 정정으로 실행되며 체결을 보장하지 않습니다. 탭 종료·절전·세션 만료·네트워크 단절 시 자동 손절 감시는 중단됩니다.</p></div><button className="icon-button" aria-label="안내 닫기" onClick={() => setHelp(false)}><X size={16} /></button></section>}
+      <section className="connection-bar"><span className="pill">KIS {session.env === 'vps' ? '모의' : '실전'} · KRX</span><span className={`connection-state ${connected ? 'online' : ''}`}><i />{stateText}</span><span className="connection-caption">Node.js 중계 · 실제 호가</span><button className="button connection-button" disabled={busy} onClick={() => connected ? disconnect() : void connect()}>{connected ? <Unplug size={14} /> : <Radio size={14} />}{connected ? '연결 종료' : 'KIS 연결 시작'}</button></section>
+      <p className="fill-status"><span>{fillDetail}</span>{pollingFills && <span>체결 확인과 익절 주문 등록에 조회 주기·통신 지연이 반영됩니다.</span>}</p>
       {message && <div className="notice message" role="status"><Activity size={16} /><span>{message}</span><button className="icon-button" aria-label="메시지 닫기" onClick={() => setMessage('')}><X size={15} /></button></div>}
       {stale && <div className="notice warning">호가 수신이 10초 이상 지연되었습니다. 신규 매수가 중지됩니다. 연결 상태를 확인해 주세요.</div>}
       <div className="workspace">
@@ -214,11 +214,8 @@ export default function App() {
         </section>
       </div>
       <section className="card activity-card"><div className="section-top"><span className="section-label">ACTIVITY</span><button className="text-button" disabled={!connected} onClick={() => void engine.current?.sync().catch(e => setMessage(errorText(e)))}>주문 상태 대조</button></div>{snapshot?.logs.length ? <div className="activity-list">{snapshot.logs.slice(0, 8).map(l => <div key={l.id} className={l.level === 'error' ? 'log-error' : ''}><time>{clock(l.time)}</time><span>{l.message}</span></div>)}</div> : <p className="muted small">연결·주문·자동 청산 이벤트가 여기에 기록됩니다.</p>}</section>
-      <footer><span><ShieldCheck size={14} /> 키는 이 브라우저에 암호화 저장됩니다.</span><span>탭이 닫히면 자동 손절 감시도 중단됩니다.</span><a href="https://github.com/YoungjuneKwon/kis-click-trader" target="_blank" rel="noreferrer">GitHub <ArrowUpRight size={12} /></a></footer>
+      <footer><span><ShieldCheck size={14} /> 인증정보는 서버 환경변수에서 관리합니다.</span><span>탭이 닫히면 자동 손절 감시도 중단됩니다.</span><a href="https://github.com/YoungjuneKwon/kis-click-trader" target="_blank" rel="noreferrer">GitHub <ArrowUpRight size={12} /></a></footer>
     </main>
-    <div id="key-popover" ref={keyPopover} popover="auto" className="key-popover"><div className="popover-heading"><div><span className="section-label">LOCAL KEY VAULT</span><h2>내 계좌 연결</h2></div><button className="icon-button" popoverTarget="key-popover" popoverTargetAction="hide" aria-label="키 입력 닫기"><X size={18} /></button></div>
-      <KeyForm stored={stored} tab={credentialTab} onTab={setCredentialTab} busy={busy || exposed} error={keyError} onSubmit={e => void handleKeys(e)} onDelete={() => void forgetKeys()} />
-    </div>
     <dialog ref={exitDialog} className="exit-dialog"><div className="popover-heading"><h2>거래를 마칠까요?</h2><button className="icon-button" aria-label="종료 창 닫기" onClick={() => exitDialog.current?.close()}><X size={18} /></button></div><p>{exposed ? `보유 ${quantityHeld}주 · 매수 확인 중 ${pending.length}건이 남아 있습니다. 화면을 닫으면 자동 손절 감시가 중단됩니다.` : '보유 수량과 미종결 주문이 없습니다. 연결을 종료할 수 있습니다.'}</p>{exposed && <p className="micro">미체결 매수·응답 불명확 주문은 HTS에서 확인·취소해 주세요. 청산 버튼은 체결된 보유 물량의 매도 주문만 정정합니다.</p>}<div className="dialog-actions"><button className="button subtle" onClick={() => exitDialog.current?.close()}>계속 거래</button>{exposed ? <button className="button primary" disabled={busy || !connected} onClick={() => void closeAll()}>보유 수량 청산</button> : <button className="button primary" onClick={disconnect}>연결 종료</button>}</div></dialog>
   </div>;
 }

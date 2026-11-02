@@ -34,4 +34,9 @@
 .symbol-options>button>svg{color:#a1adb7}
 .stock-picker-button{display:flex;align-items:center;justify-content:space-between;gap:8px;width:100%;background:transparent;border:0;padding:0;color:#303948;font-size:16px;font-weight:650;text-align:left}
 .stock-picker-button svg{position:static!important;flex-shrink:0;color:#8b94a0}
+.optional-notice{margin:16px 0;border:1px solid #e7ecf0;border-radius:8px;padding:11px 12px}
+.optional-notice summary{cursor:pointer;color:#8c99a7;font-size:10px;line-height:1.7}
+.optional-notice .micro{margin-bottom:0}
+.fill-status{display:flex;flex-wrap:wrap;gap:5px 14px;font-size:10px;color:#93a09f;line-height:1.7;margin:-8px 0 18px}
+.fill-status>span:first-child{color:#68877b}
 @media(max-width:560px){.setup-screen{padding:25px 14px;gap:20px;justify-content:flex-start}.setup-brand{margin-top:8px}.setup-window{padding:23px 20px}.setup-window h2{font-size:19px}.setup-window input,.setup-window select{font-size:16px}.setup-window .stock-avatar{display:grid}.stock-picker-button{font-size:17px}}
