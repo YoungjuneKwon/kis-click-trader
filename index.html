@@ -1,0 +1,12 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#f6f7f9" />
+    <meta name="description" content="수동 진입, 자동 청산. 브라우저에서 사용하는 KIS 트레이딩 PoC." />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https://openapi.koreainvestment.com:9443 https://openapivts.koreainvestment.com:29443 ws://ops.koreainvestment.com:21000 ws://ops.koreainvestment.com:31000 ws://localhost:* ws://127.0.0.1:*; object-src 'none'; base-uri 'self'; form-action 'self'" />
+    <title>Click Trader — 진입은 직접, 청산은 규칙대로</title>
+  </head>
+  <body><div id="root"></div><script type="module" src="/src/main.tsx"></script></body>
+</html>
