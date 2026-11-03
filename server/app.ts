@@ -59,7 +59,7 @@ export async function createApp(config: ServerConfig, options: { service?: KisSe
     const input = request.method === 'GET' ? request.query : request.body;
     if (!input || typeof input !== 'object' || Object.values(input).some(v => typeof v !== 'string')) return reply.code(400).send({ error: '잘못된 요청입니다.' });
     try { return await kis.request(request.method, path, tr, input as Record<string, string>); }
-    catch { return reply.code(502).send({ error: 'KIS 요청 결과를 확인하지 못했습니다. 주문은 자동 재전송하지 않습니다.' }); }
+    catch { return reply.code(502).send({ error: request.method === 'GET' ? 'KIS 조회에 실패했습니다. 잠시 후 다시 조회해 주세요.' : 'KIS 주문 결과를 확인하지 못했습니다. 주문은 자동 재전송하지 않습니다.' }); }
   } });
   app.get('/api/stream', { websocket: true }, (socket, request) => {
     const symbol = (request.query as { symbol?: string }).symbol;

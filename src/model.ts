@@ -13,25 +13,28 @@ export const symbols: SymbolInfo[] = [
   { code: '005380', name: '현대차' },
 ];
 export type Book = { symbol: string; time: number; asks: { price: number; qty: number }[]; bids: { price: number; qty: number }[]; last: number; totalAsk: number; totalBid: number };
+export type MarketTick = { symbol: string; time: number; price: number };
+export type MinuteBar = { symbol: string; time: number; close: number; updatedAt: number; source: 'history' | 'live' };
 export type Rule = { unit: 'won' | 'percent'; take: number; stop: number; buyFee: number; sellFee: number; tax: number };
 export const defaultRule: Rule = { unit: 'won', take: 500, stop: 300, buyFee: 0.015, sellFee: 0.015, tax: 0.2 };
 export const ruleSchema = z.object({ unit: z.enum(['won', 'percent']), take: z.number().positive(), stop: z.number().positive(), buyFee: z.number().min(0).max(5), sellFee: z.number().min(0).max(5), tax: z.number().min(0).max(5) });
 export type OrderRef = { id: string; branch: string };
-export type OrderStatus = { filled: number; average: number; remaining: number; cancelled: boolean };
+export type OrderStatus = { filled: number; average: number; remaining: number; cancelled: boolean; amount?: number };
 export interface Broker {
   kind: 'kis';
-  connect(symbol: string, onBook: (book: Book) => void, onStatus: (status: string) => void, onFill: () => void): Promise<void>;
+  connect(symbol: string, onBook: (book: Book) => void, onStatus: (status: string) => void, onFill: () => void, onTrade?: (tick: MarketTick) => void): Promise<void>;
   buy(symbol: string, qty: number): Promise<OrderRef>;
   sell(symbol: string, qty: number, price: number): Promise<OrderRef>;
   revise(order: OrderRef, symbol: string, qty: number, price: number): Promise<OrderRef | null>;
+  cancelBuy(order: OrderRef, symbol: string): Promise<OrderRef | null>;
   status(order: OrderRef, symbol: string): Promise<OrderStatus>;
   disconnect(): void;
 }
-export type Entry = { id: string; symbol: string; name: string; qty: number; filled: number; amount: number; ref?: OrderRef; state: 'sending' | 'open' | 'done' | 'unknown'; rule: Rule };
+export type Entry = { id: string; symbol: string; name: string; qty: number; filled: number; amount: number; ref?: OrderRef; state: 'sending' | 'open' | 'done' | 'unknown'; rule: Rule; createdAt?: number; closeRequested?: boolean; cancelRequested?: boolean; cancelRef?: OrderRef };
 export type Lot = { id: string; entryId: string; symbol: string; name: string; qty: number; entry: number; target: number; stop: number; sold: number; exitAmount: number; state: 'protecting' | 'protected' | 'stopping' | 'closed' | 'unknown'; reason: '익절' | '손절' | '수동 청산'; ref?: OrderRef; seenFilled: number; seenAmount: number; rule: Rule; opened: number; exitLimit?: number; revisedAt?: number };
 export type Trade = { id: string; lotId: string; symbol: string; name: string; qty: number; entry: number; exit: number; gross: number; cost: number; net: number; time: number; reason: string };
 export type Log = { id: string; time: number; message: string; level: 'info' | 'error' };
-export type Snapshot = { id: string; kind: 'kis'; accountTag: string; entries: Entry[]; lots: Lot[]; trades: Trade[]; logs: Log[]; started: number };
+export type Snapshot = { id: string; kind: 'kis'; accountTag: string; entries: Entry[]; lots: Lot[]; trades: Trade[]; logs: Log[]; started: number; updatedAt?: number };
 export function tickSize(price: number) { return price < 2000 ? 1 : price < 5000 ? 5 : price < 20000 ? 10 : price < 50000 ? 50 : price < 200000 ? 100 : price < 500000 ? 500 : 1000; }
 export function targetPrice(entry: number, rule: Rule) { const raw = entry + (rule.unit === 'won' ? rule.take : entry * rule.take / 100); return Math.ceil(raw / tickSize(raw)) * tickSize(raw); }
 export function stopPrice(entry: number, rule: Rule) { return Math.max(1, entry - (rule.unit === 'won' ? rule.stop : entry * rule.stop / 100)); }

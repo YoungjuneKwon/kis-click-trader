@@ -5,6 +5,8 @@ import react from '@vitejs/plugin-react';
 export default defineConfig({
   plugins: [react()],
   base: './',
+  // Keep hashed chunks available for already-open trading tabs during a new build.
+  build: { emptyOutDir: false },
   server: {
     strictPort: true,
     watch: { usePolling: true, interval: 1500 },

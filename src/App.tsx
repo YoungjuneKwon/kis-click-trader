@@ -1,15 +1,18 @@
-import { lazy, Suspense, useEffect, useRef, useState, type FormEvent } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 import { Activity, ArrowDown, ArrowDownRight, ArrowRight, ArrowUpRight, Check, ChevronDown, CircleHelp, LockKeyhole, Power, Radio, Settings2, ShieldCheck, Unplug, X } from 'lucide-react';
-import { clock, ruleSchema, signed, symbols, won, type Book, type Broker, type ServerSession, type Rule, type Snapshot, type SymbolInfo } from './model';
-import { clearClientSecrets, loadPreferences, savePreferences, saveSnapshot, sessions } from './storage';
+import { clock, ruleSchema, signed, symbols, won, type Book, type Broker, type MarketTick, type MinuteBar, type ServerSession, type Rule, type Snapshot, type SymbolInfo } from './model';
+import { clearClientSecrets, loadPreferences, savePreferences, saveSnapshot, sessions, sessionToRestore } from './storage';
 import { TradingEngine } from './engine';
 import { KisBroker } from './kis';
 import { LockForm, SetupScreen, SymbolPicker } from './Setup';
 import { lockServer, serverStatus, unlockServer } from './api';
+import EntryHistory from './EntryHistory';
+import { screenLots, screenTrades } from './entry-summary';
+import { mergeMinutes, minuteFromTick } from './intraday';
 
 const initial = loadPreferences();
 const PerformanceChart = lazy(() => import('./PerformanceChart'));
-const stateLabel = { protecting: '익절 등록 중', protected: '감시 중', stopping: '청산 정정 중', closed: '청산 완료', unknown: '주문 확인 필요' };
+const IntradayChart = lazy(() => import('./IntradayChart'));
 function errorText(e: unknown) { return e instanceof Error ? e.message : '처리에 실패했습니다.'; }
 
 export default function App() {
@@ -22,6 +25,11 @@ export default function App() {
   const [message, setMessage] = useState('');
   const [authError, setAuthError] = useState('');
   const [busy, setBusy] = useState(false);
+  const [closingId, setClosingId] = useState<string>();
+  const [outsideHoldings, setOutsideHoldings] = useState<number>();
+  const [minuteBars, setMinuteBars] = useState<MinuteBar[]>([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState('');
   const [session, setSession] = useState<ServerSession>();
   const [sessionChecked, setSessionChecked] = useState(false);
   const [backendReady, setBackendReady] = useState(false);
@@ -35,15 +43,19 @@ export default function App() {
   const poll = useRef<ReturnType<typeof setInterval> | undefined>(undefined);
   const exitDialog = useRef<HTMLDialogElement>(null);
   const bookElement = useRef<HTMLDivElement>(null);
-  const quantityHeld = snapshot?.lots.reduce((n, l) => n + l.qty - l.sold, 0) || 0;
+  const chartBars = useRef<MinuteBar[]>([]);
+  const chartPaint = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const historySequence = useRef(0);
+  const managedLots = snapshot ? screenLots(snapshot) : [];
+  const quantityHeld = managedLots.reduce((n, l) => n + l.qty - l.sold, 0);
   const exposed = !!snapshot && (snapshot.entries.some(e => e.state !== 'done') || snapshot.lots.some(l => l.state !== 'closed'));
-  const activeLots = snapshot?.lots.filter(l => l.state !== 'closed') || [];
+  const activeLots = managedLots.filter(l => l.state !== 'closed');
   const pending = snapshot?.entries.filter(e => e.state !== 'done') || [];
-  const trades = snapshot?.trades || [];
+  const trades = snapshot ? screenTrades(snapshot) : [];
   const net = trades.reduce((n, t) => n + t.net, 0);
   const cost = trades.reduce((n, t) => n + t.cost, 0);
   const bid = book?.bids[0]?.price || 0;
-  const unrealized = book ? activeLots.reduce((n, l) => n + (bid - l.entry) * (l.qty - l.sold), 0) : undefined;
+  const unrealized = book && bid > 0 && now - book.time <= 10000 && activeLots.every(l => l.symbol === book.symbol) ? activeLots.reduce((n, l) => n + (bid - l.entry) * (l.qty - l.sold), 0) : undefined;
   const connected = status === 'connected';
   const stale = !!book && now - book.time > 10000;
 
@@ -53,7 +65,7 @@ export default function App() {
     const locked = () => { clearInterval(poll.current); broker.current?.disconnect(); release.current?.(); release.current = undefined; liveConnection.current = false; setBook(undefined); setStatus('idle'); setSession(undefined); setAuthError('서버 세션이 잠겼습니다. 다시 인증해 주세요.'); };
     window.addEventListener('click-trader:locked', locked);
     const timer = setInterval(() => setNow(Date.now()), 1000);
-    return () => { window.removeEventListener('click-trader:locked', locked); clearInterval(timer); clearInterval(poll.current); broker.current?.disconnect(); release.current?.(); };
+    return () => { window.removeEventListener('click-trader:locked', locked); clearInterval(timer); clearInterval(poll.current); clearTimeout(chartPaint.current); broker.current?.disconnect(); release.current?.(); };
   }, []);
   useEffect(() => { try { savePreferences({ selected, quantity, rule }); } catch { setMessage('브라우저 설정 저장에 실패했습니다.'); } }, [selected, quantity, rule]);
   useEffect(() => { const el = bookElement.current; if (el && book) el.scrollTop = Math.max(0, (el.scrollHeight - el.clientHeight) / 2); }, [book?.symbol]);
@@ -62,6 +74,33 @@ export default function App() {
     const prevent = (event: BeforeUnloadEvent) => { event.preventDefault(); event.returnValue = ''; };
     window.addEventListener('beforeunload', prevent); return () => window.removeEventListener('beforeunload', prevent);
   }, [exposed]);
+  const receiveTrade = useCallback((source: Broker, tick: MarketTick) => {
+    if (broker.current !== source) return;
+    chartBars.current = mergeMinutes(chartBars.current, [minuteFromTick(tick)], tick.symbol);
+    if (!chartPaint.current) chartPaint.current = setTimeout(() => { chartPaint.current = undefined; setMinuteBars([...chartBars.current]); }, 250);
+  }, []);
+  const loadHistory = useCallback(async (source: KisBroker, symbol: string) => {
+    const sequence = ++historySequence.current;
+    setHistoryLoading(true); setHistoryError('');
+    try {
+      const bars = await source.minuteHistory(symbol);
+      if (broker.current !== source || sequence !== historySequence.current) return;
+      chartBars.current = mergeMinutes(chartBars.current, bars, symbol); setMinuteBars([...chartBars.current]);
+    } catch (error) {
+      if (broker.current === source && sequence === historySequence.current) setHistoryError(`분봉 조회 지연: ${errorText(error)} 실시간으로 확보한 구간만 표시합니다.`);
+    } finally { if (broker.current === source && sequence === historySequence.current) setHistoryLoading(false); }
+  }, []);
+  useEffect(() => {
+    const source = broker.current;
+    if (!connected || !selected || !(source instanceof KisBroker)) return;
+    void loadHistory(source, selected.code);
+    const timer = setInterval(() => { void loadHistory(source, selected.code); }, 60000);
+    return () => { clearInterval(timer); historySequence.current++; };
+  }, [connected, selected?.code, loadHistory]);
+  const refreshHistory = useCallback(() => {
+    const source = broker.current, symbol = engine.current?.book?.symbol;
+    if (source instanceof KisBroker && symbol) void loadHistory(source, symbol);
+  }, [loadHistory]);
   async function acquire() {
     if (release.current) return;
     if (!navigator.locks) throw new Error('이 브라우저는 단일 거래 탭 잠금을 지원하지 않습니다. 최신 브라우저의 HTTPS 또는 localhost에서 실행해 주세요.');
@@ -78,12 +117,12 @@ export default function App() {
     if (exposed) {
       if (nextSymbol.code !== selected?.code) { setMessage('보유·미체결 주문을 모두 정리한 뒤 종목을 바꿔 주세요.'); return; }
       setBusy(true); setMessage('');
-      try { await acquire(); await broker.current!.connect(nextSymbol.code, b => engine.current!.onBook(b), connectionStatus, () => { void engine.current!.sync().catch(e => setMessage(errorText(e))); }); await engine.current!.sync(); }
+      try { await acquire(); const source = broker.current!; await source.connect(nextSymbol.code, b => engine.current!.onBook(b), connectionStatus, () => { void engine.current!.sync().catch(e => setMessage(errorText(e))); }, tick => receiveTrade(source, tick)); await engine.current!.sync(); }
       catch (e) { setMessage(errorText(e)); connectionStatus('error'); }
       finally { setBusy(false); }
       return;
     }
-    setBusy(true); setMessage(''); connectionStatus('connecting');
+    setBusy(true); setMessage(''); setOutsideHoldings(undefined); chartBars.current = []; setMinuteBars([]); setHistoryError(''); connectionStatus('connecting');
     let next: Broker | undefined;
     try {
       if (session.env === 'vps') throw new Error('KIS 모의계좌의 정정가능조회 지원은 미검증입니다. 현재 버전은 실전 어댑터만 연결합니다.');
@@ -91,13 +130,15 @@ export default function App() {
       next = new KisBroker(session.env);
       const tag = session.accountTag;
       const history = await sessions();
-      const restored = history.find(s => s.kind === 'kis' && s.accountTag === tag && (s.entries.some(e => e.state !== 'done') || s.lots.some(l => l.state !== 'closed')));
-      if (restored && restored.started < new Date().setHours(0, 0, 0, 0)) throw new Error('이전 날짜의 미종결 거래가 있습니다. HTS에서 잔고·주문을 대조해야 합니다. 이 PoC는 당일 주문만 복구합니다.');
+      const restored = sessionToRestore(history, tag);
+      const tradingDay = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Seoul' });
+      if (restored && tradingDay.format(restored.started) !== tradingDay.format(Date.now())) throw new Error('이전 날짜의 미종결 거래가 있습니다. HTS에서 잔고·주문을 대조해야 합니다. 이 PoC는 당일 주문만 복구합니다.');
       const restoredSymbol = restored?.lots.find(l => l.state !== 'closed')?.symbol || restored?.entries.find(e => e.state !== 'done')?.symbol;
       if (restoredSymbol && restoredSymbol !== nextSymbol.code) { const s = symbols.find(s => s.code === restoredSymbol) || { code: restoredSymbol, name: restoredSymbol }; setSelected(s); nextSymbol = s; }
       const instance = new TradingEngine(next, saveSnapshot, () => { if (engine.current === instance) { setSnapshot(structuredClone(instance.state)); setBook(liveConnection.current ? instance.book : undefined); } }, tag, restored);
       engine.current = instance; broker.current = next; setSnapshot(structuredClone(instance.state)); setSelected(nextSymbol);
-      await next.connect(nextSymbol.code, b => instance.onBook(b), connectionStatus, () => { void instance.sync().catch(e => setMessage(errorText(e))); });
+      const source = next;
+      await source.connect(nextSymbol.code, b => instance.onBook(b), connectionStatus, () => { void instance.sync().catch(e => setMessage(errorText(e))); }, tick => receiveTrade(source, tick));
       await saveSnapshot(instance.state);
       if (next instanceof KisBroker) instance.log(next.fillDetail);
       poll.current = setInterval(() => { if (instance.exposed) void instance.sync().catch(e => setMessage(errorText(e))); }, 3000);
@@ -106,6 +147,7 @@ export default function App() {
         const actual = await next.inventory(nextSymbol.code);
         if (actual.qty < instance.quantity) { for (const lot of instance.state.lots) if (lot.state !== 'closed') lot.state = 'unknown'; await saveSnapshot(instance.state); throw new Error('실제 잔고가 저장된 관리 수량보다 적습니다. 외부 거래 내역을 확인해 주세요.'); }
         instance.log(`계좌 잔고 대조: ${actual.qty}주 · 이 앱 관리 ${instance.quantity}주. 기존 보유분은 자동 편입하지 않습니다.`);
+        setOutsideHoldings(Math.max(0, actual.qty - instance.quantity));
       }
     } catch (e) {
       setMessage(errorText(e)); connectionStatus('error');
@@ -116,6 +158,7 @@ export default function App() {
     liveConnection.current = value === 'connected';
     setStatus(value);
     setBook(value === 'connected' ? engine.current?.book : undefined);
+    if (value !== 'connected') setHistoryLoading(false);
   }
   function disconnect() {
     if (engine.current?.exposed) { exitDialog.current?.showModal(); return; }
@@ -130,6 +173,13 @@ export default function App() {
   async function closeAll() {
     if (!engine.current) return; setBusy(true); setMessage('');
     try { await engine.current.closeAll(); await engine.current.sync(); } catch (e) { setMessage(errorText(e)); } finally { setBusy(false); }
+  }
+  async function closeEntry(entryId: string) {
+    if (!engine.current || busy || !connected) return;
+    setBusy(true); setClosingId(entryId); setMessage('');
+    try { await engine.current.closeEntry(entryId); await engine.current.sync(); }
+    catch (e) { setMessage(errorText(e)); }
+    finally { setBusy(false); setClosingId(undefined); }
   }
   async function handleUnlock(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setBusy(true); setAuthError('');
@@ -152,9 +202,11 @@ export default function App() {
   }
   function changeSymbol() {
     if (exposed || busy) return;
-    disconnect(); broker.current = null; engine.current = null; setSnapshot(undefined); setSelected(undefined); setMessage('');
+    disconnect(); broker.current = null; engine.current = null; setSnapshot(undefined); setOutsideHoldings(undefined); chartBars.current = []; setMinuteBars([]); setHistoryError(''); setSelected(undefined); setMessage('');
   }
-  const maxQty = Math.max(1, ...(book?.asks.map(a => a.qty) || []), ...(book?.bids.map(b => b.qty) || []));
+  const visibleAsks = book?.asks.slice(0, 4) || [];
+  const visibleBids = book?.bids.slice(0, 4) || [];
+  const maxQty = Math.max(1, ...visibleAsks.map(a => a.qty), ...visibleBids.map(b => b.qty));
   const total = (book?.totalAsk || 0) + (book?.totalBid || 0);
   const stateText = status === 'idle' ? '연결 대기' : status === 'connected' ? 'KIS 연결됨' : status === 'connecting' ? '연결 중' : status === 'error' ? '연결 실패' : status === 'disconnected' ? '연결 끊김' : status;
   const pollingFills = !(broker.current instanceof KisBroker) || broker.current.fillMode === 'polling';
@@ -181,14 +233,15 @@ export default function App() {
           <div className="section-top"><span className="section-label">MARKET</span><span className="tiny-status"><i className={connected ? 'pulse-dot' : ''} />{book ? clock(book.time) : '시세 대기'}</span></div>
           <div className="stock-heading"><div className="stock-avatar">{selected.name.slice(0, 1)}</div><div className="stock-select"><button className="stock-picker-button" disabled={exposed || busy} onClick={changeSymbol} aria-label="종목 변경">{selected.name}<ChevronDown size={14} /></button><span>{selected.code} <span className="exchange-label">KRX</span></span></div><div className="stock-price"><strong>{book ? won(book.last || bid) : '—'}</strong><span>{book ? stale ? '원 · 마지막 수신 가격' : book.last ? '원 · 실시간 체결가' : '원 · 최우선 매수호가' : '실제 호가 수신 대기'}</span></div></div>
           <div className="book-head"><span>매도 잔량</span><span>호가 (원)</span><span>매수 잔량</span></div>
-          <div className="orderbook" aria-label="10단계 호가창" ref={bookElement}>
+          <div className="orderbook" aria-label="매도·매수 각 4단계 호가창" ref={bookElement}>
             {book ? <>
-              {[...book.asks].reverse().map((a, i) => <div className="book-row ask" key={`a${i}`}><div className="depth-cell"><span className="depth-bar" style={{ width: `${a.qty / maxQty * 100}%` }} /><span>{won(a.qty)}</span></div><strong>{won(a.price)}</strong><span /></div>)}
+              {[...visibleAsks].reverse().map((a, i) => <div className="book-row ask" key={`a${i}`}><div className="depth-cell"><span className="depth-bar" style={{ width: `${a.qty / maxQty * 100}%` }} /><span>{won(a.qty)}</span></div><strong>{won(a.price)}</strong><span /></div>)}
               <div className="spread"><span>스프레드</span><strong>{won(book.asks[0].price - book.bids[0].price)}원</strong><span>{stale ? 'STALE' : 'LIVE KRX'}</span></div>
-              {book.bids.map((b, i) => <div className="book-row bid" key={`b${i}`}><span /><strong>{won(b.price)}</strong><div className="depth-cell"><span className="depth-bar" style={{ width: `${b.qty / maxQty * 100}%` }} /><span>{won(b.qty)}</span></div></div>)}
+              {visibleBids.map((b, i) => <div className="book-row bid" key={`b${i}`}><span /><strong>{won(b.price)}</strong><div className="depth-cell"><span className="depth-bar" style={{ width: `${b.qty / maxQty * 100}%` }} /><span>{won(b.qty)}</span></div></div>)}
             </> : <div className="empty-book"><Radio size={30} strokeWidth={1.3} /><strong>실제 호가 수신 대기</strong><p>KIS 연결 후 수신한 가격과 잔량만 표시합니다.<br />연결되지 않으면 시세를 표시하지 않습니다.</p><button className="button subtle" disabled={busy} onClick={() => void connect()}>호가 연결 <ArrowRight size={14} /></button></div>}
           </div>
-          <div className="book-total"><span className="ask-text">{book ? won(book.totalAsk) : '—'}</span><span>총 잔량</span><span className="bid-text">{book ? won(book.totalBid) : '—'}</span></div>{book && <div className="imbalance"><span style={{ width: `${total ? (book.totalAsk / total * 100) : 0}%` }} /></div>}
+          <div className="book-total"><span className="ask-text">{book ? won(book.totalAsk) : '—'}</span><span>전체 호가 총잔량</span><span className="bid-text">{book ? won(book.totalBid) : '—'}</span></div>{book && <div className="imbalance"><span style={{ width: `${total ? (book.totalAsk / total * 100) : 0}%` }} /></div>}
+          <Suspense fallback={<div className="intraday-empty">차트 준비 중</div>}><IntradayChart bars={minuteBars} loading={historyLoading} error={historyError} connected={connected} now={now} onRefresh={refreshHistory} /></Suspense>
         </section>
         <div className="trading-column">
           <section className="card trade-card"><div className="section-top"><span className="section-label">QUICK BUY</span><span className="pill">최유리 지정가</span></div><h2>한 번의 클릭으로 진입</h2><p className="muted small">체결 즉시 익절 주문, 손절은 호가로 감시합니다.</p>
@@ -199,13 +252,14 @@ export default function App() {
             <div className="estimated"><span>예상 주문 금액</span><strong>{book ? `${won((book.asks[0]?.price || 0) * quantity)}원` : '—'}</strong></div>
             <button className="buy-button" disabled={!connected || !book || busy || stale || engine.current?.uncertain || !ruleSchema.safeParse(rule).success} onClick={() => void buy()}><span>{busy ? '처리 중…' : `${quantity}주 매수`}</span><ArrowRight size={20} /></button><p className="buy-caption">실제 계좌 주문 · 체결 가격은 호가에 따라 달라집니다</p>
           </section>
-          <section className="card position-card"><div className="section-top"><span className="section-label">POSITION</span><span className={`pill ${quantityHeld ? 'green' : ''}`}><ShieldCheck size={12} />{quantityHeld ? '자동 청산 관리' : '진입 대기'}</span></div><div className="position-summary"><div><span className="muted small">이 앱 관리 수량</span><strong>{snapshot ? quantityHeld : '—'}<small>주</small></strong></div><div className="right"><span className="muted small">평가손익 · 비용 전</span><strong className={unrealized === undefined ? '' : unrealized >= 0 ? 'positive' : 'negative'}>{unrealized === undefined ? '—' : quantityHeld ? signed(unrealized) : '0'}<small>원</small></strong></div></div>
-            {pending.map(e => <div className="pending-order" key={e.id}>{e.name} 매수 {e.filled}/{e.qty}주 · {e.state === 'unknown' || e.state === 'sending' ? '응답 확인 필요 · HTS 주문내역 대조' : '미체결 감시 중'}</div>)}
-            {activeLots.length ? <div className="lot-list">{activeLots.map(l => <div className="lot" key={l.id}><div><strong>{l.name} {l.qty - l.sold}주</strong><span>{won(l.entry)}원 진입</span></div><div className="right"><strong className={l.state === 'unknown' ? 'negative' : ''}>{stateLabel[l.state]}</strong><span>익절 {won(l.target)} · 손절 {l.stop > 0 ? won(l.stop) : '청산 진행'}</span></div></div>)}</div> : <p className="position-empty">{pending.length ? '매수 체결을 기다리고 있습니다.' : '체결된 포지션이 여기에 표시됩니다.'}</p>}
-            {exposed && <button className="button full subtle" disabled={busy || !connected} onClick={() => void closeAll()}>보유 수량 청산</button>}
+          <section className="card position-card"><div className="section-top"><span className="section-label">THIS SCREEN ONLY</span><span className={`pill ${quantityHeld ? 'green' : ''}`}><ShieldCheck size={12} />{quantityHeld ? '자동 청산 관리' : '진입 대기'}</span></div><div className="position-summary"><div><span className="muted small">이 화면 거래분 · 미청산</span><strong>{snapshot ? quantityHeld : '—'}<small>주</small></strong></div><div className="right"><span className="muted small">자체 미실현손익 · 비용 전</span><strong className={unrealized === undefined ? '' : unrealized >= 0 ? 'positive' : 'negative'}>{unrealized === undefined ? '—' : quantityHeld ? signed(unrealized) : '0'}<small>원</small></strong></div></div>
+            <p className="position-scope">기존 보유분은 청산·손익 계산에서 제외합니다.{outsideHoldings !== undefined && <span>연결 시 확인한 관리 대상 외 보유분: {outsideHoldings}주</span>}</p>
+            {pending.length > 0 && <p className="pending-order">미체결·확인 중인 매수 주문 {pending.length}건 · 아래 진입 내역에서 확인해 주세요.</p>}
+            <a className="text-button entry-jump" href="#entry-history">진입건별 내역 {snapshot?.entries.length || 0}건 보기 <ArrowDown size={12} /></a>
+            {exposed && <button className="button full subtle" disabled={busy || !connected || stale || !book} onClick={() => void closeAll()}>이 화면 거래분 전체 청산</button>}
           </section>
         </div>
-        <section className="card performance-card"><div className="section-top"><span className="section-label">SESSION PERFORMANCE</span><span className="pill">실현손익 · 비용 추정 반영</span></div><div className="performance-heading"><div><p className="muted small">이번 세션 누적 실현손익</p><strong className={`pnl-number ${net > 0 ? 'positive' : net < 0 ? 'negative' : ''}`}>{signed(net)}<small>원</small></strong></div><div className="session-date">{new Date(now).toLocaleDateString('ko-KR', { month: 'long', day: 'numeric' })}<span>{snapshot ? `${clock(snapshot.started)} 시작` : '세션 대기'}</span></div></div>
+        <section className="card performance-card"><div className="section-top"><span className="section-label">SESSION PERFORMANCE</span><span className="pill">이 화면 거래만 · 자체 계산</span></div><div className="performance-heading"><div><p className="muted small">이 화면 거래 순실현손익 · 추정 비용 차감</p><strong className={`pnl-number ${net > 0 ? 'positive' : net < 0 ? 'negative' : ''}`}>{signed(net)}<small>원</small></strong></div><div className="session-date">{new Date(now).toLocaleDateString('ko-KR', { month: 'long', day: 'numeric' })}<span>{snapshot ? `${clock(snapshot.started)} 시작` : '세션 대기'}</span></div></div>
           {trades.length ? <Suspense fallback={<div className="pnl-chart" />}><PerformanceChart trades={trades} started={snapshot?.started || now} now={now} /></Suspense> : <div className="pnl-chart"><div className="chart-empty"><span>아직 실현손익 데이터가 없습니다.</span><strong>실제 매도 체결 후 차트가 표시됩니다.</strong></div></div>}
           <div className="metrics"><div><span>청산 체결</span><strong>{trades.length}<small>건</small></strong></div><div><span>승률 · 순손익 기준</span><strong>{trades.length ? Math.round(trades.filter(t => t.net > 0).length / trades.length * 100) : '—'}<small>{trades.length ? '%' : ''}</small></strong></div><div><span>추정 거래 비용</span><strong>{won(cost)}<small>원</small></strong></div></div>
           <div className="history-heading"><h3>체결 기록</h3><button className="text-button" onClick={exportTrades} disabled={!snapshot}>내보내기 <ArrowDown size={12} /></button></div>
@@ -213,9 +267,10 @@ export default function App() {
           <div className="cost-settings"><button className="text-button" onClick={() => setAdvanced(!advanced)}><Settings2 size={13} /> 비용률 설정 <ChevronDown size={12} /></button>{advanced && <div className="cost-fields">{([['buyFee', '매수 수수료'], ['sellFee', '매도 수수료'], ['tax', '매도 세금']] as const).map(([key, label]) => <label key={key}>{label} (%)<input type="number" min="0" max="5" step="0.001" value={rule[key]} onChange={e => setRule({ ...rule, [key]: Number(e.target.value) })} /></label>)}<p>예시 비용률입니다. 본인 계좌·종목에 맞게 수정해 주세요. 변경 후 매수부터 적용됩니다.</p></div>}</div>
         </section>
       </div>
+      <div id="entry-history"><EntryHistory snapshot={snapshot} book={book} now={now} busy={busy} connected={connected} closingId={closingId} onClose={id => void closeEntry(id)} /></div>
       <section className="card activity-card"><div className="section-top"><span className="section-label">ACTIVITY</span><button className="text-button" disabled={!connected} onClick={() => void engine.current?.sync().catch(e => setMessage(errorText(e)))}>주문 상태 대조</button></div>{snapshot?.logs.length ? <div className="activity-list">{snapshot.logs.slice(0, 8).map(l => <div key={l.id} className={l.level === 'error' ? 'log-error' : ''}><time>{clock(l.time)}</time><span>{l.message}</span></div>)}</div> : <p className="muted small">연결·주문·자동 청산 이벤트가 여기에 기록됩니다.</p>}</section>
       <footer><span><ShieldCheck size={14} /> 인증정보는 서버 환경변수에서 관리합니다.</span><span>탭이 닫히면 자동 손절 감시도 중단됩니다.</span><a href="https://github.com/YoungjuneKwon/kis-click-trader" target="_blank" rel="noreferrer">GitHub <ArrowUpRight size={12} /></a></footer>
     </main>
-    <dialog ref={exitDialog} className="exit-dialog"><div className="popover-heading"><h2>거래를 마칠까요?</h2><button className="icon-button" aria-label="종료 창 닫기" onClick={() => exitDialog.current?.close()}><X size={18} /></button></div><p>{exposed ? `보유 ${quantityHeld}주 · 매수 확인 중 ${pending.length}건이 남아 있습니다. 화면을 닫으면 자동 손절 감시가 중단됩니다.` : '보유 수량과 미종결 주문이 없습니다. 연결을 종료할 수 있습니다.'}</p>{exposed && <p className="micro">미체결 매수·응답 불명확 주문은 HTS에서 확인·취소해 주세요. 청산 버튼은 체결된 보유 물량의 매도 주문만 정정합니다.</p>}<div className="dialog-actions"><button className="button subtle" onClick={() => exitDialog.current?.close()}>계속 거래</button>{exposed ? <button className="button primary" disabled={busy || !connected} onClick={() => void closeAll()}>보유 수량 청산</button> : <button className="button primary" onClick={disconnect}>연결 종료</button>}</div></dialog>
+    <dialog ref={exitDialog} className="exit-dialog"><div className="popover-heading"><h2>거래를 마칠까요?</h2><button className="icon-button" aria-label="종료 창 닫기" onClick={() => exitDialog.current?.close()}><X size={18} /></button></div><p>{exposed ? `이 화면 거래분 미청산 ${quantityHeld}주 · 매수 확인 중 ${pending.length}건이 남아 있습니다. 화면을 닫으면 자동 손절 감시가 중단됩니다.` : '이 화면의 미청산 수량과 미종결 주문이 없습니다. 연결을 종료할 수 있습니다.'}</p>{exposed && <p className="micro">이 화면의 매수 주문·체결분만 처리합니다. 기존 보유분은 청산하지 않습니다. 응답 불명확 주문은 HTS에서 확인해 주세요.</p>}<div className="dialog-actions"><button className="button subtle" onClick={() => exitDialog.current?.close()}>계속 거래</button>{exposed ? <button className="button primary" disabled={busy || !connected || stale || !book} onClick={() => void closeAll()}>이 화면 거래분 전체 청산</button> : <button className="button primary" onClick={disconnect}>연결 종료</button>}</div></dialog>
   </div>;
 }

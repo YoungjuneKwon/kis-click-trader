@@ -47,6 +47,7 @@ export class KisService {
     const routes: Record<string, string[]> = {
       'GET /uapi/domestic-stock/v1/quotations/inquire-price': ['FHKST01010100'],
       'GET /uapi/domestic-stock/v1/quotations/inquire-asking-price-exp-ccn': ['FHKST01010200'],
+      'GET /uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice': ['FHKST03010200'],
       'GET /uapi/domestic-stock/v1/trading/inquire-balance': [`${p}8434R`],
       'GET /uapi/domestic-stock/v1/trading/inquire-daily-ccld': [`${p}0081R`],
       'GET /uapi/domestic-stock/v1/trading/inquire-psbl-rvsecncl': this.config.env === 'prod' ? ['TTTC0084R'] : [],

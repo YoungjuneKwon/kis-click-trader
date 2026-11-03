@@ -1,9 +1,10 @@
 import { serverStatus } from './api';
 import { Rejected } from './engine';
-import type { Book, Broker, OrderRef, OrderStatus } from './model';
+import type { Book, Broker, MarketTick, MinuteBar, OrderRef, OrderStatus } from './model';
+import { mergeMinutes, minuteFromHistory, seoulHour, seoulTimestamp } from './intraday';
 
 type Row = Record<string, string>;
-type ApiData = { rt_cd?: string; msg1?: string; msg_cd?: string; error?: string; output?: Row | Row[]; output1?: Row[]; ctx_area_fk100?: string; ctx_area_nk100?: string };
+type ApiData = { rt_cd?: string; msg1?: string; msg_cd?: string; error?: string; output?: Row | Row[]; output1?: Row[]; output2?: Row[]; ctx_area_fk100?: string; ctx_area_nk100?: string };
 const date = () => new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Seoul' }).format(new Date()).replaceAll('-', '');
 const num = (value: unknown) => Number(value) || 0;
 export function parseBook(payload: string): Book {
@@ -38,12 +39,12 @@ export class KisBroker implements Broker {
     if (data.rt_cd && data.rt_cd !== '0') throw new Rejected(`KIS ${data.msg_cd || ''}: ${data.msg1 || '요청 거절'}`);
     return data;
   }
-  async connect(symbol: string, onBook: (book: Book) => void, onStatus: (status: string) => void, onFill: () => void) {
+  async connect(symbol: string, onBook: (book: Book) => void, onStatus: (status: string) => void, onFill: () => void, onTrade?: (tick: MarketTick) => void) {
     clearTimeout(this.reconnect);
     if (this.socket) { this.socket.onclose = null; this.socket.close(); }
     this.marketReady = false; this.realtimeFills = false; this.detail = ''; this.quote = 0;
     this.stopped = false; onStatus('connecting');
-    if (!await serverStatus()) throw new Error('먼저 화면 잠금을 해제해 주세요.');
+    if (!await serverStatus()) { window.dispatchEvent(new Event('click-trader:locked')); throw new Error('먼저 화면 잠금을 해제해 주세요.'); }
     return new Promise<void>((resolve, reject) => {
       const socket = this.socket = new WebSocket(`${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/api/stream?symbol=${symbol}`);
       const timeout = setTimeout(() => { reject(new Error('실제 KIS 호가 수신 시간초과')); socket.close(); }, 20000);
@@ -60,7 +61,11 @@ export class KisBroker implements Broker {
           if (!Number.isInteger(width)) throw new Error('시세 묶음 형식 오류');
           for (let i = 0; i < count; i++) {
             const record = fields.slice(i * width, (i + 1) * width);
-            if (tr === 'H0STCNT0') this.quote = num(record[2]);
+            if (tr === 'H0STCNT0') {
+              this.quote = num(record[2]);
+              const timestamp = seoulTimestamp(record[33], record[1]);
+              if (timestamp !== undefined && this.quote > 0 && record[0] === symbol) onTrade?.({ symbol, time: timestamp, price: this.quote });
+            }
             if (tr === 'H0STASP0') {
               const book = parseBook(record.join('^')); book.last = this.quote; onBook(book);
               if (!this.marketReady) { this.marketReady = true; onStatus('connected'); onFill(); }
@@ -74,9 +79,23 @@ export class KisBroker implements Broker {
         clearTimeout(timeout); this.marketReady = false; this.realtimeFills = false; onStatus('disconnected');
         if (!resolved) reject(new Error('KIS 호가 연결이 완료되지 않았습니다.'));
         if (event.code === 1008) { window.dispatchEvent(new Event('click-trader:locked')); return; }
-        if (!this.stopped && resolved) this.reconnect = setTimeout(() => { void this.connect(symbol, onBook, onStatus, onFill).catch(() => onStatus('재연결 실패 · 연결 버튼으로 재시도')); }, 3000);
+        if (!this.stopped && resolved) this.reconnect = setTimeout(() => { void this.connect(symbol, onBook, onStatus, onFill, onTrade).catch(() => onStatus('재연결 실패 · 연결 버튼으로 재시도')); }, 3000);
       };
     });
+  }
+  async minuteHistory(symbol: string): Promise<MinuteBar[]> {
+    let cursor = Date.now(); let bars: MinuteBar[] = [];
+    for (let page = 0; page < 2; page++) {
+      const data = await this.request('/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice', 'FHKST03010200', { FID_COND_MRKT_DIV_CODE: 'J', FID_INPUT_ISCD: symbol, FID_INPUT_HOUR_1: seoulHour(cursor), FID_PW_DATA_INCU_YN: 'Y', FID_ETC_CLS_CODE: '' });
+      const batch = (data.output2 || []).map(row => minuteFromHistory(symbol, row)).filter((bar): bar is MinuteBar => !!bar);
+      bars = mergeMinutes(bars, batch, symbol);
+      if (!batch.length || bars.length >= 40) break;
+      const earliest = Math.min(...batch.map(b => b.time));
+      const next = earliest - 1000;
+      if (next >= cursor || date() !== new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Seoul' }).format(next).replaceAll('-', '')) break;
+      cursor = next;
+    }
+    return bars;
   }
   private ref(data: ApiData): OrderRef { const row = data.output as Row; if (!row?.ODNO) throw new Error('주문번호 없는 응답: 주문 내역 확인 필요'); return { id: row.ODNO, branch: row.KRX_FWDG_ORD_ORGNO }; }
   async buy(symbol: string, qty: number) {
@@ -86,28 +105,39 @@ export class KisBroker implements Broker {
   async sell(symbol: string, qty: number, price: number) {
     return this.ref(await this.request('/uapi/domestic-stock/v1/trading/order-cash', this.env === 'prod' ? 'TTTC0011U' : 'VTTC0011U', { PDNO: symbol, ORD_DVSN: '00', ORD_QTY: String(qty), ORD_UNPR: String(price), EXCG_ID_DVSN_CD: 'KRX', SLL_TYPE: '', CNDT_PRIC: '' }, true));
   }
-  async revise(ref: OrderRef, _symbol: string, qty: number, price: number) {
+  private async modifiable(ref: OrderRef, symbol: string, side: '1' | '2') {
     if (this.env === 'vps') throw new Rejected('모의투자 정정가능조회 지원은 미검증입니다.');
     let fk = '', nk = ''; let row: Row | undefined;
     for (let page = 0; page < 20; page++) {
-      const data = await this.request('/uapi/domestic-stock/v1/trading/inquire-psbl-rvsecncl', 'TTTC0084R', { INQR_DVSN_1: '0', INQR_DVSN_2: '1', CTX_AREA_FK100: fk, CTX_AREA_NK100: nk }, false, page ? 'N' : '');
-      row = (Array.isArray(data.output) ? data.output : []).find(r => num(r.odno) === num(ref.id));
+      const data = await this.request('/uapi/domestic-stock/v1/trading/inquire-psbl-rvsecncl', 'TTTC0084R', { INQR_DVSN_1: '0', INQR_DVSN_2: side, CTX_AREA_FK100: fk, CTX_AREA_NK100: nk }, false, page ? 'N' : '');
+      row = (Array.isArray(data.output) ? data.output : []).find(r => num(r.odno) === num(ref.id) && r.pdno === symbol);
       if (row) break; const next = data.ctx_area_nk100 || ''; if (!next || next === nk) break; fk = data.ctx_area_fk100 || ''; nk = next;
     }
-    if (!row || num(row.psbl_qty) <= 0) return null;
+    return row && num(row.psbl_qty) > 0 ? row : undefined;
+  }
+  async revise(ref: OrderRef, symbol: string, qty: number, price: number) {
+    const row = await this.modifiable(ref, symbol, '1');
+    if (!row) return null;
     return this.ref(await this.request('/uapi/domestic-stock/v1/trading/order-rvsecncl', 'TTTC0013U', { KRX_FWDG_ORD_ORGNO: row.krx_fwdg_ord_orgno || ref.branch, ORGN_ODNO: ref.id, ORD_DVSN: '00', RVSE_CNCL_DVSN_CD: '01', ORD_QTY: String(Math.min(qty, num(row.psbl_qty))), ORD_UNPR: String(price), QTY_ALL_ORD_YN: 'N', EXCG_ID_DVSN_CD: 'KRX' }, true));
+  }
+  async cancelBuy(ref: OrderRef, symbol: string) {
+    const row = await this.modifiable(ref, symbol, '2');
+    if (!row) return null;
+    return this.ref(await this.request('/uapi/domestic-stock/v1/trading/order-rvsecncl', 'TTTC0013U', { KRX_FWDG_ORD_ORGNO: row.krx_fwdg_ord_orgno || ref.branch, ORGN_ODNO: ref.id, ORD_DVSN: '03', RVSE_CNCL_DVSN_CD: '02', ORD_QTY: '0', ORD_UNPR: '0', QTY_ALL_ORD_YN: 'Y', EXCG_ID_DVSN_CD: 'KRX' }, true));
   }
   async status(ref: OrderRef, symbol: string): Promise<OrderStatus> {
     const data = await this.request('/uapi/domestic-stock/v1/trading/inquire-daily-ccld', this.env === 'prod' ? 'TTTC0081R' : 'VTTC0081R', { INQR_STRT_DT: date(), INQR_END_DT: date(), SLL_BUY_DVSN_CD: '00', PDNO: symbol, CCLD_DVSN: '00', INQR_DVSN: '00', INQR_DVSN_3: '00', ORD_GNO_BRNO: ref.branch, ODNO: ref.id, INQR_DVSN_1: '', CTX_AREA_FK100: '', CTX_AREA_NK100: '', EXCG_ID_DVSN_CD: 'KRX' });
     const row = data.output1?.find(r => num(r.odno) === num(ref.id));
     if (!row) throw new Error('주문 조회에 아직 반영되지 않았습니다. 자동 재주문하지 않고 다시 조회합니다.');
-    return { filled: num(row.tot_ccld_qty), average: num(row.avg_prvs), remaining: num(row.rmn_qty), cancelled: row.cncl_yn === 'Y' };
+    const filled = num(row.tot_ccld_qty), amount = num(row.tot_ccld_amt);
+    return { filled, average: num(row.avg_prvs), remaining: num(row.rmn_qty), cancelled: row.cncl_yn === 'Y', amount: amount > 0 || filled === 0 ? amount : undefined };
   }
   async inventory(symbol: string) {
     const data = await this.request('/uapi/domestic-stock/v1/trading/inquire-balance', this.env === 'prod' ? 'TTTC8434R' : 'VTTC8434R', { AFHR_FLPR_YN: 'N', OFL_YN: '', INQR_DVSN: '02', UNPR_DVSN: '01', FUND_STTL_ICLD_YN: 'N', FNCG_AMT_AUTO_RDPT_YN: 'N', PRCS_DVSN: '00', CTX_AREA_FK100: '', CTX_AREA_NK100: '' });
     const row = data.output1?.find(r => r.pdno === symbol);
     if (!row && (data.ctx_area_nk100 || data.ctx_area_fk100)) throw new Error('잔고 연속조회가 필요한 계좌입니다. 수동 대조가 필요합니다.');
-    return { qty: num(row?.hldg_qty), average: num(row?.pchs_avg_pric) };
+    // Account inventory is a reconciliation check only; P&L and entry prices use our own fills.
+    return { qty: num(row?.hldg_qty) };
   }
   disconnect() { this.stopped = true; clearTimeout(this.reconnect); this.socket?.close(); this.marketReady = false; this.realtimeFills = false; }
 }
