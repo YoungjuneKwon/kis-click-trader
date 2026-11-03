@@ -52,6 +52,7 @@ export default function App() {
   const activeLots = managedLots.filter(l => l.state !== 'closed');
   const pending = snapshot?.entries.filter(e => e.state !== 'done') || [];
   const trades = snapshot ? screenTrades(snapshot) : [];
+  const applicableEntries = snapshot?.entries.filter(entry => !entry.closeRequested && (entry.state !== 'done' || managedLots.some(lot => lot.entryId === entry.id && lot.sold < lot.qty && lot.reason === '익절'))).length || 0;
   const net = trades.reduce((n, t) => n + t.net, 0);
   const cost = trades.reduce((n, t) => n + t.cost, 0);
   const bid = book?.bids[0]?.price || 0;
@@ -181,6 +182,15 @@ export default function App() {
     catch (e) { setMessage(errorText(e)); }
     finally { setBusy(false); setClosingId(undefined); }
   }
+  async function applyCurrentRules() {
+    if (!engine.current || busy || !connected) return;
+    setBusy(true); setMessage('');
+    try {
+      const result = await engine.current.applyRules(rule);
+      setMessage(`현재 진입 ${result.entries}건 처리 · 익절 정정 접수 ${result.takeOrders}건 · 손절 기준 갱신 ${result.stopLots}건${result.stopExits ? ` · 손절 조건 충족 ${result.stopExits}건 청산 처리` : ''}${result.pending ? ` · 정정 체결 대조 대기 ${result.pending}건` : ''}${result.failed ? ` · 확인 필요 ${result.failed}건: 진입 내역과 실행 로그를 확인해 주세요.` : ''}`);
+    } catch (error) { setMessage(errorText(error)); }
+    finally { setBusy(false); }
+  }
   async function handleUnlock(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setBusy(true); setAuthError('');
     const element = event.currentTarget;
@@ -248,7 +258,8 @@ export default function App() {
             <div className="field-title">매수 수량 <span>주</span></div><div className="quantity-control"><button aria-label="매수 수량 줄이기" disabled={quantity <= 1} onClick={() => setQuantity(Math.max(1, quantity - 1))}>−</button><input aria-label="매수 수량" type="number" min="1" max="100000" value={quantity} onChange={e => setQuantity(Math.min(100000, Math.max(1, Math.trunc(Number(e.target.value) || 1))))} /><button aria-label="매수 수량 늘리기" onClick={() => setQuantity(Math.min(100000, quantity + 1))}>+</button></div><div className="quantity-presets">{[1, 5, 10].map(n => <button key={n} className={quantity === n ? 'selected' : ''} onClick={() => setQuantity(n)}>{n}주</button>)}</div>
             <div className="rule-heading"><span className="field-title">자동 청산 규칙</span><div className="unit-tabs"><button className={rule.unit === 'won' ? 'active' : ''} onClick={() => setRule({ ...rule, unit: 'won', take: 500, stop: 300 })}>금액</button><button className={rule.unit === 'percent' ? 'active' : ''} onClick={() => setRule({ ...rule, unit: 'percent', take: 1, stop: .5 })}>비율</button></div></div>
             <div className="rule-inputs"><label><span><ArrowUpRight size={14} /> 익절</span><div><span className="sign">+</span><input aria-label="익절 기준" type="number" min="0.01" step={rule.unit === 'won' ? 100 : .1} value={rule.take} onChange={e => setRule({ ...rule, take: Number(e.target.value) })} /><span>{rule.unit === 'won' ? '원' : '%'}</span></div></label><label><span><ArrowDownRight size={14} /> 손절</span><div><span className="sign">−</span><input aria-label="손절 기준" type="number" min="0.01" step={rule.unit === 'won' ? 100 : .1} value={rule.stop} onChange={e => setRule({ ...rule, stop: Number(e.target.value) })} /><span>{rule.unit === 'won' ? '원' : '%'}</span></div></label></div>
-            <p className="rule-note">실제 체결가 기준 · 금액은 1주당 가격 차이<br />기존 포지션의 규칙은 유지됩니다.</p>
+            <p className="rule-note">실제 체결가 기준 · 금액은 1주당 가격 차이<br />다음 매수에는 입력값이 적용됩니다.</p>
+            {applicableEntries > 0 && <div className="rule-apply"><button className="button full" disabled={busy || !connected || !book || stale || engine.current?.uncertain || !ruleSchema.safeParse(rule).success} onClick={() => void applyCurrentRules()}>익절·손절 적용 <span>현재 진입 {applicableEntries}건</span></button><p>입력을 마친 뒤 적용하면 기존 진입건도 갱신합니다. 새 손절 기준에 도달한 경우 즉시 청산 조건을 확인합니다.</p></div>}
             <div className="estimated"><span>예상 주문 금액</span><strong>{book ? `${won((book.asks[0]?.price || 0) * quantity)}원` : '—'}</strong></div>
             <button className="buy-button" disabled={!connected || !book || busy || stale || engine.current?.uncertain || !ruleSchema.safeParse(rule).success} onClick={() => void buy()}><span>{busy ? '처리 중…' : `${quantity}주 매수`}</span><ArrowRight size={20} /></button><p className="buy-caption">실제 계좌 주문 · 체결 가격은 호가에 따라 달라집니다</p>
           </section>
@@ -259,15 +270,19 @@ export default function App() {
             {exposed && <button className="button full subtle" disabled={busy || !connected || stale || !book} onClick={() => void closeAll()}>이 화면 거래분 전체 청산</button>}
           </section>
         </div>
+        <div className="performance-column">
         <section className="card performance-card"><div className="section-top"><span className="section-label">SESSION PERFORMANCE</span><span className="pill">이 화면 거래만 · 자체 계산</span></div><div className="performance-heading"><div><p className="muted small">이 화면 거래 순실현손익 · 추정 비용 차감</p><strong className={`pnl-number ${net > 0 ? 'positive' : net < 0 ? 'negative' : ''}`}>{signed(net)}<small>원</small></strong></div><div className="session-date">{new Date(now).toLocaleDateString('ko-KR', { month: 'long', day: 'numeric' })}<span>{snapshot ? `${clock(snapshot.started)} 시작` : '세션 대기'}</span></div></div>
           {trades.length ? <Suspense fallback={<div className="pnl-chart" />}><PerformanceChart trades={trades} started={snapshot?.started || now} now={now} /></Suspense> : <div className="pnl-chart"><div className="chart-empty"><span>아직 실현손익 데이터가 없습니다.</span><strong>실제 매도 체결 후 차트가 표시됩니다.</strong></div></div>}
           <div className="metrics"><div><span>청산 체결</span><strong>{trades.length}<small>건</small></strong></div><div><span>승률 · 순손익 기준</span><strong>{trades.length ? Math.round(trades.filter(t => t.net > 0).length / trades.length * 100) : '—'}<small>{trades.length ? '%' : ''}</small></strong></div><div><span>추정 거래 비용</span><strong>{won(cost)}<small>원</small></strong></div></div>
+          <details className="performance-details"><summary>청산 체결 기록 {trades.length}건 <ChevronDown size={12} /></summary>
           <div className="history-heading"><h3>체결 기록</h3><button className="text-button" onClick={exportTrades} disabled={!snapshot}>내보내기 <ArrowDown size={12} /></button></div>
           <div className="trade-history">{trades.length ? [...trades].reverse().map(t => <div className="trade-row" key={t.id}><span className={`trade-icon ${t.net >= 0 ? 'gain' : 'loss'}`}>{t.net >= 0 ? <ArrowUpRight size={15} /> : <ArrowDownRight size={15} />}</span><div><strong>{t.name} <span>{t.qty}주 · {t.reason}</span></strong><small>{clock(t.time)} · {won(t.entry)} → {won(t.exit)}</small></div><strong className={t.net >= 0 ? 'positive' : 'negative'}>{signed(t.net)}<small>원</small></strong></div>) : <div className="empty-history"><Check size={17} /><span>아직 청산된 거래가 없습니다.</span></div>}</div>
+          </details>
           <div className="cost-settings"><button className="text-button" onClick={() => setAdvanced(!advanced)}><Settings2 size={13} /> 비용률 설정 <ChevronDown size={12} /></button>{advanced && <div className="cost-fields">{([['buyFee', '매수 수수료'], ['sellFee', '매도 수수료'], ['tax', '매도 세금']] as const).map(([key, label]) => <label key={key}>{label} (%)<input type="number" min="0" max="5" step="0.001" value={rule[key]} onChange={e => setRule({ ...rule, [key]: Number(e.target.value) })} /></label>)}<p>예시 비용률입니다. 본인 계좌·종목에 맞게 수정해 주세요. 변경 후 매수부터 적용됩니다.</p></div>}</div>
         </section>
+        <div id="entry-history"><EntryHistory snapshot={snapshot} book={book} now={now} busy={busy} connected={connected} closingId={closingId} onClose={id => void closeEntry(id)} /></div>
+        </div>
       </div>
-      <div id="entry-history"><EntryHistory snapshot={snapshot} book={book} now={now} busy={busy} connected={connected} closingId={closingId} onClose={id => void closeEntry(id)} /></div>
       <section className="card activity-card"><div className="section-top"><span className="section-label">ACTIVITY</span><button className="text-button" disabled={!connected} onClick={() => void engine.current?.sync().catch(e => setMessage(errorText(e)))}>주문 상태 대조</button></div>{snapshot?.logs.length ? <div className="activity-list">{snapshot.logs.slice(0, 8).map(l => <div key={l.id} className={l.level === 'error' ? 'log-error' : ''}><time>{clock(l.time)}</time><span>{l.message}</span></div>)}</div> : <p className="muted small">연결·주문·자동 청산 이벤트가 여기에 기록됩니다.</p>}</section>
       <footer><span><ShieldCheck size={14} /> 인증정보는 서버 환경변수에서 관리합니다.</span><span>탭이 닫히면 자동 손절 감시도 중단됩니다.</span><a href="https://github.com/YoungjuneKwon/kis-click-trader" target="_blank" rel="noreferrer">GitHub <ArrowUpRight size={12} /></a></footer>
     </main>

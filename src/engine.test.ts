@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { Rejected, TradingEngine } from './engine';
-import { defaultRule, type Book, type Broker, type OrderRef, type OrderStatus } from './model';
+import { defaultRule, type Book, type Broker, type OrderRef, type OrderStatus, type Snapshot } from './model';
 import { parseBook } from './kis';
 
 const symbol = { code: '005930', name: '삼성전자' };
@@ -29,7 +29,15 @@ class Fake implements Broker {
   async status(ref: OrderRef) { return { ...this.statuses.get(ref.id)! }; }
   async connect() {} disconnect() {}
 }
-function setup(b = new Fake()) { const persist = vi.fn(async () => {}); const engine = new TradingEngine(b, persist, () => {}, 'test'); engine.onBook(book()); return { b, engine, persist }; }
+function setup(b = new Fake()) { const persist = vi.fn(async (_snapshot: Snapshot) => {}); const engine = new TradingEngine(b, persist, () => {}, 'test'); engine.onBook(book()); return { b, engine, persist }; }
+function pendingRuleRevision(b: Fake) {
+  b.revise.mockImplementation(async (ref, _symbol, qty, _price) => {
+    const old = b.statuses.get(ref.id)!; old.remaining = 0; old.cancelled = true;
+    const next = { id: `updated${++b.n}`, branch: '1' };
+    b.statuses.set(next.id, { filled: 0, average: 0, remaining: qty, cancelled: false });
+    return next;
+  });
+}
 describe('order lifecycle', () => {
   it('persists intent before sending and protects only confirmed fill quantity', async () => {
     const { b, engine, persist } = setup();
@@ -138,6 +146,86 @@ describe('order lifecycle', () => {
     expect(engine.state.trades.map(t => t.qty)).toEqual([1, 2]);
     expect(engine.state.trades.reduce((n, t) => n + t.gross, 0)).toBe(-500);
     expect(engine.quantity).toBe(0); expect(b.accountQuantity).toBe(1);
+  });
+});
+describe('applying take-profit and stop rules to existing entries', () => {
+  it('revises the actual take-profit and updates stop monitoring without changing captured costs', async () => {
+    const { b, engine } = setup(); await engine.buy(symbol, 1, defaultRule); pendingRuleRevision(b);
+    const previousRef = engine.state.lots[0].ref!;
+    const result = await engine.applyRules({ ...defaultRule, take: 3000, stop: 1000, buyFee: 2, sellFee: 2, tax: 2 });
+    const lot = engine.state.lots[0];
+    expect(b.revise).toHaveBeenCalledWith(previousRef, '005930', 1, 75100);
+    expect(lot.target).toBe(75100); expect(lot.stop).toBe(71100); expect(lot.state).toBe('protected');
+    expect(lot.rule.buyFee).toBe(defaultRule.buyFee); expect(engine.state.entries[0].rule.tax).toBe(defaultRule.tax);
+    expect(result).toMatchObject({ entries: 1, takeOrders: 1, stopLots: 1, failed: 0 });
+    expect(engine.quantity).toBe(1); expect(b.accountQuantity).toBe(2); // existing external share is untouched
+  });
+  it('applies percentage rules to later partial fills of the same buy order', async () => {
+    const { b, engine } = setup();
+    b.buy.mockImplementationOnce(async () => { b.accountQuantity++; b.statuses.set('buy', { filled: 1, average: 72100, remaining: 2, cancelled: false }); return { id: 'buy', branch: '1' }; });
+    await engine.buy(symbol, 3, defaultRule); pendingRuleRevision(b);
+    await engine.applyRules({ ...defaultRule, unit: 'percent', take: 2, stop: 1 });
+    b.accountQuantity += 2; b.statuses.set('buy', { filled: 3, average: 72100, remaining: 0, cancelled: false });
+    await engine.sync();
+    expect(b.sell).toHaveBeenLastCalledWith('005930', 2, 73600);
+    expect(engine.state.lots.every(l => l.target === 73600 && l.stop === 71379)).toBe(true);
+    expect(engine.quantity).toBe(3); expect(b.accountQuantity).toBe(4);
+  });
+  it('does not change a closing entry or any pre-existing account share', async () => {
+    const { b, engine } = setup(); await engine.buy(symbol, 1, defaultRule); await engine.buy(symbol, 1, defaultRule); pendingRuleRevision(b);
+    engine.state.entries[0].closeRequested = true;
+    const first = engine.state.lots[0], original = first.ref!;
+    first.reason = '수동 청산'; first.stop = -1; first.exitLimit = 71000;
+    await engine.applyRules({ ...defaultRule, take: 3000, stop: 1000 });
+    expect(b.revise).toHaveBeenCalledTimes(1); expect(b.revise.mock.calls[0][0].id).not.toBe(original.id);
+    expect(first.target).toBe(72600); expect(first.stop).toBe(-1); expect(b.accountQuantity).toBe(3);
+  });
+  it('uses the existing sell order to exit if the new stop is already crossed', async () => {
+    const { b, engine } = setup(); await engine.buy(symbol, 1, defaultRule);
+    const old = engine.state.lots[0].ref!;
+    const result = await engine.applyRules({ ...defaultRule, take: 3000, stop: 50 });
+    expect(b.revise).toHaveBeenCalledTimes(1); expect(b.revise).toHaveBeenCalledWith(old, '005930', 1, expect.any(Number));
+    expect(result.stopExits).toBe(1); expect(engine.state.trades[0].reason).toBe('손절'); expect(b.accountQuantity).toBe(1);
+  });
+  it('records a take-profit filling during the revision and modifies only its remainder', async () => {
+    const { b, engine } = setup(); await engine.buy(symbol, 3, defaultRule);
+    const oldRef = engine.state.lots[0].ref!;
+    b.revise.mockImplementationOnce(async () => {
+      b.accountQuantity--; b.statuses.set(oldRef.id, { filled: 1, average: 72600, remaining: 0, cancelled: true });
+      b.statuses.set('updated', { filled: 0, average: 0, remaining: 2, cancelled: false }); return { id: 'updated', branch: '1' };
+    });
+    await engine.applyRules({ ...defaultRule, take: 3000, stop: 1000 });
+    expect(engine.state.trades).toHaveLength(1); expect(engine.state.trades[0].qty).toBe(1);
+    expect(engine.quantity).toBe(2); expect(engine.state.lots[0].target).toBe(75100); expect(b.accountQuantity).toBe(3);
+  });
+  it('persists the acknowledged new order and finishes reconciliation without resubmitting', async () => {
+    const { b, engine, persist } = setup(); await engine.buy(symbol, 1, defaultRule); pendingRuleRevision(b);
+    const oldRef = engine.state.lots[0].ref!, status = b.status.bind(b); let failed = false;
+    vi.spyOn(b, 'status').mockImplementation(async ref => {
+      if (ref.id === oldRef.id && b.revise.mock.calls.length && !failed) { failed = true; throw new Error('test query timeout'); }
+      return status(ref);
+    });
+    const result = await engine.applyRules({ ...defaultRule, take: 3000, stop: 1000 });
+    expect(result.pending).toBe(1); expect(engine.state.lots[0].revision?.ref.id).toMatch(/^updated/);
+    expect(persist.mock.calls.some(([s]) => s.lots[0]?.revision?.ref.id.startsWith('updated'))).toBe(true);
+    await engine.sync();
+    expect(engine.state.lots[0].revision).toBeUndefined(); expect(engine.state.lots[0].state).toBe('protected');
+    expect(engine.state.lots[0].target).toBe(75100); expect(b.revise).toHaveBeenCalledTimes(1);
+  });
+  it('keeps the old take-profit on a definite rejection while retaining the updated stop', async () => {
+    const { b, engine } = setup(); await engine.buy(symbol, 1, defaultRule);
+    b.revise.mockRejectedValueOnce(new Rejected('test price rejection'));
+    const result = await engine.applyRules({ ...defaultRule, take: 3000, stop: 1000 });
+    expect(result.failed).toBe(1); expect(engine.state.lots[0].target).toBe(72600); expect(engine.state.lots[0].stop).toBe(71100);
+    expect(engine.state.lots[0].state).toBe('protected'); expect(b.revise).toHaveBeenCalledTimes(1);
+  });
+  it('does not revise take-profit when only the stop changes or the same values are reapplied', async () => {
+    const { b, engine } = setup(); await engine.buy(symbol, 1, defaultRule); pendingRuleRevision(b);
+    await engine.applyRules({ ...defaultRule, stop: 1000 });
+    expect(b.revise).not.toHaveBeenCalled(); expect(engine.state.lots[0].stop).toBe(71100);
+    await engine.applyRules({ ...defaultRule, take: 3000, stop: 1000 });
+    await engine.applyRules({ ...defaultRule, take: 3000, stop: 1000 });
+    expect(b.revise).toHaveBeenCalledTimes(1);
   });
 });
 describe('KIS H0STASP0 wire format', () => {

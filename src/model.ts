@@ -31,7 +31,8 @@ export interface Broker {
   disconnect(): void;
 }
 export type Entry = { id: string; symbol: string; name: string; qty: number; filled: number; amount: number; ref?: OrderRef; state: 'sending' | 'open' | 'done' | 'unknown'; rule: Rule; createdAt?: number; closeRequested?: boolean; cancelRequested?: boolean; cancelRef?: OrderRef };
-export type Lot = { id: string; entryId: string; symbol: string; name: string; qty: number; entry: number; target: number; stop: number; sold: number; exitAmount: number; state: 'protecting' | 'protected' | 'stopping' | 'closed' | 'unknown'; reason: '익절' | '손절' | '수동 청산'; ref?: OrderRef; seenFilled: number; seenAmount: number; rule: Rule; opened: number; exitLimit?: number; revisedAt?: number };
+export type LotRevision = { ref: OrderRef; target: number; stop: number; reason: '익절' | '손절' | '수동 청산'; rule: Rule; requestedAt: number };
+export type Lot = { id: string; entryId: string; symbol: string; name: string; qty: number; entry: number; target: number; stop: number; sold: number; exitAmount: number; state: 'protecting' | 'protected' | 'updating' | 'stopping' | 'closed' | 'unknown'; reason: '익절' | '손절' | '수동 청산'; ref?: OrderRef; seenFilled: number; seenAmount: number; rule: Rule; opened: number; exitLimit?: number; revisedAt?: number; revision?: LotRevision };
 export type Trade = { id: string; lotId: string; symbol: string; name: string; qty: number; entry: number; exit: number; gross: number; cost: number; net: number; time: number; reason: string };
 export type Log = { id: string; time: number; message: string; level: 'info' | 'error' };
 export type Snapshot = { id: string; kind: 'kis'; accountTag: string; entries: Entry[]; lots: Lot[]; trades: Trade[]; logs: Log[]; started: number; updatedAt?: number };

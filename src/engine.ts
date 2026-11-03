@@ -1,4 +1,4 @@
-import { aggressivePrice, stopPrice, targetPrice, uid, type Book, type Broker, type Entry, type Lot, type Rule, type Snapshot, type SymbolInfo } from './model';
+import { aggressivePrice, ruleSchema, stopPrice, targetPrice, uid, type Book, type Broker, type Entry, type Lot, type Rule, type Snapshot, type SymbolInfo } from './model';
 import { screenLots } from './entry-summary';
 
 export class Rejected extends Error {}
@@ -13,7 +13,7 @@ export class TradingEngine {
     this.state = restored || { id: uid(), kind: broker.kind, accountTag, entries: [], lots: [], trades: [], logs: [], started: Date.now() };
   }
   get exposed() { return this.state.entries.some(e => e.state !== 'done') || this.state.lots.some(l => l.state !== 'closed'); }
-  get uncertain() { return this.state.entries.some(e => e.state === 'unknown' || e.state === 'sending') || this.state.lots.some(l => l.state === 'unknown' || l.state === 'protecting' || l.state === 'stopping'); }
+  get uncertain() { return this.state.entries.some(e => e.state === 'unknown' || e.state === 'sending') || this.state.lots.some(l => l.state === 'unknown' || l.state === 'protecting' || l.state === 'updating' || l.state === 'stopping'); }
   get quantity() { return screenLots(this.state).reduce((n, l) => n + l.qty - l.sold, 0); }
   log(message: string, level: 'info' | 'error' = 'info') { this.state.logs.unshift({ id: uid(), time: Date.now(), message, level }); this.state.logs = this.state.logs.slice(0, 150); this.change(); }
   private checkpoint() {
@@ -84,8 +84,85 @@ export class TradingEngine {
     return this.run(async () => {
       try {
         for (const e of this.state.entries) await this.syncEntry(e);
-        for (const l of this.state.lots) await this.syncLot(l);
+        const hasRevisions = this.state.lots.some(l => l.revision);
+        for (const l of this.state.lots) { if (l.revision) await this.finishRevision(l); else await this.syncLot(l); }
+        if (hasRevisions && this.book) this.onBook(this.book);
       } finally { try { await this.checkpoint(); } finally { this.syncing = false; } }
+    });
+  }
+  private ownerOf(lot: Lot) {
+    const owner = this.state.entries.find(e => e.id === lot.entryId && e.symbol === lot.symbol && e.ref);
+    if (!owner || this.state.lots.filter(l => l.entryId === owner.id).reduce((n, l) => n + l.qty, 0) > owner.filled) throw new Error('이 화면의 매수 체결로 확인되지 않은 수량은 변경할 수 없습니다.');
+    return owner;
+  }
+  private async finishRevision(lot: Lot) {
+    const revision = lot.revision;
+    if (!revision) return;
+    this.ownerOf(lot);
+    // Reconcile fills racing on the previous order before switching cumulative counters.
+    await this.syncLot(lot, true);
+    if (lot.sold >= lot.qty) { lot.state = 'closed'; delete lot.revision; await this.checkpoint(); return; }
+    lot.ref = revision.ref; lot.target = revision.target; lot.stop = revision.stop;
+    lot.rule = revision.rule; lot.reason = revision.reason; lot.seenFilled = 0; lot.seenAmount = 0;
+    lot.state = 'protected'; delete lot.revision;
+    await this.checkpoint();
+    await this.syncLot(lot);
+  }
+  applyRules(rule: Rule) {
+    return this.run(async () => {
+      ruleSchema.parse(rule);
+      if (this.uncertain) throw new Error('확인 중인 주문이 있습니다. 상태 대조 후 규칙을 적용해 주세요.');
+      if (!this.book || Date.now() - this.book.time > 10000 || !this.book.bids[0]?.price) throw new Error('최신 호가를 받은 뒤 규칙을 적용할 수 있습니다.');
+      const result = { entries: 0, takeOrders: 0, stopLots: 0, failed: 0, pending: 0, stopExits: 0 };
+      for (const entry of this.state.entries) {
+        if (entry.closeRequested || entry.symbol !== this.book.symbol) continue;
+        const liveLots = () => this.state.lots.filter(l => l.entryId === entry.id && l.sold < l.qty && l.reason === '익절');
+        if (entry.state === 'done' && !liveLots().length) continue;
+        result.entries++;
+        // Commission/tax settings remain the ones captured by this entry.
+        entry.rule = { ...entry.rule, unit: rule.unit, take: rule.take, stop: rule.stop };
+        await this.checkpoint();
+        try { await this.syncEntry(entry); }
+        catch (error) { result.failed++; this.log(`진입건 체결 대조 지연: ${error instanceof Error ? error.message : '조회 실패'}`, 'error'); }
+        for (const lot of liveLots()) {
+          if (!lot.ref || lot.state !== 'protected') { result.failed++; continue; }
+          this.ownerOf(lot);
+          try { await this.syncLot(lot); }
+          catch (error) { result.failed++; this.log(`규칙 적용 전 체결 대조 실패: ${error instanceof Error ? error.message : '조회 실패'}`, 'error'); continue; }
+          if (lot.sold >= lot.qty || lot.state !== 'protected') continue;
+          const nextRule = { ...lot.rule, unit: rule.unit, take: rule.take, stop: rule.stop };
+          const nextTarget = targetPrice(lot.entry, nextRule), nextStop = stopPrice(lot.entry, nextRule);
+          lot.rule = nextRule; lot.stop = nextStop; result.stopLots++;
+          await this.checkpoint();
+          if (this.book.bids[0].price <= nextStop) {
+            await this.exitLot(lot, '손절'); result.stopExits++; continue;
+          }
+          if (lot.target === nextTarget) continue;
+          lot.state = 'updating'; await this.checkpoint();
+          let revised;
+          try { revised = await this.broker.revise(lot.ref, lot.symbol, lot.qty - lot.sold, nextTarget); }
+          catch (error) {
+            lot.state = error instanceof Rejected ? 'protected' : 'unknown'; result.failed++;
+            this.log(`익절 정정 확인 필요: ${error instanceof Error ? error.message : '응답 불명확'}`, 'error');
+            await this.checkpoint(); continue;
+          }
+          if (!revised) {
+            try { await this.syncLot(lot, true); } catch { /* keep the original order reference */ }
+            if (lot.sold < lot.qty) { lot.state = 'unknown'; result.failed++; this.log('익절 정정 가능 잔량을 확인하지 못했습니다.', 'error'); }
+            await this.checkpoint(); continue;
+          }
+          result.takeOrders++;
+          // Persist the acknowledged new order before any further network reads.
+          lot.revision = { ref: revised, target: nextTarget, stop: nextStop, rule: nextRule, reason: '익절', requestedAt: Date.now() };
+          await this.checkpoint();
+          try { await this.finishRevision(lot); }
+          catch (error) { result.pending++; this.log(`익절 정정 접수 · 체결 대조 대기: ${error instanceof Error ? error.message : '조회 지연'}`, 'error'); }
+        }
+      }
+      this.log(`규칙 적용: 진입 ${result.entries}건 · 익절 정정 ${result.takeOrders}건 · 손절 기준 ${result.stopLots}건 갱신`);
+      await this.checkpoint();
+      if (this.book) this.onBook(this.book);
+      return result;
     });
   }
   onBook(book: Book) {
@@ -104,8 +181,7 @@ export class TradingEngine {
   }
   private async exitLot(lot: Lot, reason: Lot['reason']) {
     if (!lot.ref || lot.state !== 'protected') return;
-    const owner = this.state.entries.find(e => e.id === lot.entryId && e.symbol === lot.symbol && e.ref);
-    if (!owner || this.state.lots.filter(l => l.entryId === owner.id).reduce((n, l) => n + l.qty, 0) > owner.filled) throw new Error('이 화면의 매수 체결로 확인되지 않은 수량은 청산할 수 없습니다.');
+    this.ownerOf(lot);
     if (!this.book || this.book.symbol !== lot.symbol || Date.now() - this.book.time > 10000) throw new Error('호가가 오래되어 정정 가격을 계산할 수 없습니다.');
     await this.syncLot(lot); // an already-filled take-profit must not trigger a second sale
     if (lot.state !== 'protected') return;

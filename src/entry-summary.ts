@@ -22,15 +22,16 @@ export function summarizeEntry(snapshot: Snapshot, entry: Entry, book?: Book, no
   const soldAmount = trades.reduce((n, t) => n + t.exit * t.qty, 0);
   const freshBook = book?.symbol === entry.symbol && book.bids[0]?.price > 0 && now - book.time <= 10000;
   const unrealized = remaining === 0 ? 0 : freshBook ? lots.reduce((n, l) => n + (book!.bids[0].price - l.entry) * (l.qty - l.sold), 0) : undefined;
-  const uncertain = entry.state === 'unknown' || entry.state === 'sending' || lots.some(l => l.state === 'unknown' || l.state === 'protecting' || l.state === 'stopping');
+  const updating = lots.some(l => l.state === 'updating');
+  const uncertain = entry.state === 'unknown' || entry.state === 'sending' || lots.some(l => l.state === 'unknown' || l.state === 'protecting' || l.state === 'updating' || l.state === 'stopping');
   const completed = entry.state === 'done' && entry.filled > 0 && remaining === 0;
-  const status = uncertain ? '확인 필요'
+  const status = updating ? '규칙 적용 중' : uncertain ? '확인 필요'
     : completed ? '청산 완료'
     : entry.closeRequested ? '청산 진행 중'
     : entry.filled === 0 ? entry.state === 'done' ? '매수 미체결 종료' : '매수 대기'
     : sold > 0 ? '일부 청산' : '자동 청산 감시';
   return {
-    entry, lots, remaining, sold, pending, gross, cost, net, unrealized, uncertain, completed, status,
+    entry, lots, remaining, sold, pending, gross, cost, net, unrealized, uncertain, updating, completed, status,
     averageEntry: entry.filled > 0 ? entry.amount / entry.filled : undefined,
     averageExit: sold > 0 ? soldAmount / sold : undefined,
     createdAt: entry.createdAt || lots[0]?.opened,
